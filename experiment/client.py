@@ -11,7 +11,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from utils import (
     HAS_GEMINI,
@@ -19,6 +19,8 @@ from utils import (
     setup_gemini,
     call_gemini,
     call_openrouter,
+    normalize_api_model,
+    resolve_api_key,
     load_hf_model,
     call_hf_model,
 )
@@ -39,6 +41,8 @@ class ChainOfThoughtReader:
         use_api: bool = False,
         api_key: Optional[str] = None,
         api_provider: str = "gemini",
+        api_model: Optional[str] = None,
+        reasoning_enabled: Optional[bool] = None,
         output_dir: str = "output",
         load_in_8bit: bool = False,
     ):
@@ -56,12 +60,13 @@ class ChainOfThoughtReader:
 
         # API support
         self.use_api = use_api
-        self.api_provider = api_provider
-        self.api_key = api_key or (os.getenv("GEMINI_API_KEY") if api_provider == "gemini" else os.getenv("OPENROUTER_API_KEY"))
-        self.api_model_name = None  # set externally if needed
+        self.api_provider = api_provider.strip().lower()
+        self.reasoning_enabled = reasoning_enabled
+        self.api_key = resolve_api_key(self.api_provider, api_key)
+        self.api_model_name = normalize_api_model(self.api_provider, api_model)
         if self.use_api and self.api_provider == "gemini":
             self.gemini_model = setup_gemini(
-                api_key=self.api_key, model_name="gemini-3-pro-preview"
+                api_key=self.api_key, model_name=self.api_model_name
             )
 
         # Model and tokenizer will be loaded lazily on first use (only for HuggingFace models)
@@ -82,6 +87,7 @@ class ChainOfThoughtReader:
         prompt: str,
         system_prompt: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
+        image: Optional[Any] = None,
     ) -> tuple:
         """
         Call the language model (HuggingFace or Gemini API).
@@ -91,15 +97,38 @@ class ChainOfThoughtReader:
         """
         if self.use_api:
             if self.api_provider == "openrouter":
-                model = getattr(self, "api_model_name", None) or "anthropic/claude-opus-4.6"
-                return call_openrouter(self.api_key, model, prompt, system_prompt, max_new_tokens)
+                return call_openrouter(
+                    self.api_key,
+                    self.api_model_name,
+                    prompt,
+                    system_prompt,
+                    max_new_tokens,
+                    reasoning_enabled=self.reasoning_enabled,
+                    image=image,
+                )
+            if image is not None:
+                raise ValueError(
+                    "Multimodal solution calls currently require "
+                    "--api-provider openrouter."
+                )
             return call_gemini(self.gemini_model, prompt, system_prompt, max_new_tokens)
 
+        if image is not None:
+            raise ValueError(
+                "Multimodal solution calls require --use-api with "
+                "--api-provider openrouter."
+            )
         self._load_model()
         return call_hf_model(
             self.model, self.tokenizer, self.model_name,
             prompt, system_prompt, max_new_tokens, self.device,
         )
+
+    @staticmethod
+    def _require_nonempty_text(value, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} is empty.")
+        return value
 
     def load_encyclopedia(self, encyclopedia_path: str, mode: str = "text"):
         """Load encyclopedia for solving problems with learned insights.
@@ -380,7 +409,7 @@ Format Rules:
 
 **Example:**
 {{
-  "trace_polynomialFactoring": "The major idea is how we can turn a polynomial into a product of simpler expressions. This skill is particularly useful for quadratic and higher-degree polynomial equations where factoring can simplify the problem. Factoring reduces complex polynomials to simpler equations. When solving equations with polynomial expressions that can be factored, especially when the polynomial has recognizable patterns like difference of squares (a²-b²), perfect square trinomials (a²±2ab+b²), or common factors.  
+  "trace_polynomialFactoring": "The major idea is how we can turn a polynomial into a product of simpler expressions. This skill is particularly useful for quadratic and higher-degree polynomial equations where factoring can simplify the problem. Factoring reduces complex polynomials to simpler equations. When solving equations with polynomial expressions that can be factored, especially when the polynomial has recognizable patterns like difference of squares (a²-b²), perfect square trinomials (a²±2ab+b²), or common factors.",
   "trace_depthFirstSearchImplementation": "This algorithm is essential for problems involving path finding, cycle detection, topological sorting, connected components, or exploring all possible solutions in a search space. DFS explores depth before breadth, using stack-based recursion or explicit stack. It is memory-efficient for deep structures and naturally handles backtracking. The visited set prevents infinite loops and redundant work. DFS is the foundation for many graph algorithms including topological sort, strongly connected components, and maze solving. When you need to explore or traverse a graph, tree, or nested structure systematically, going as deep as possible before backtracking. Use DFS when you need to visit all nodes in a connected component, find paths between nodes, detect cycles, or explore recursive structures like file systems, nested data, or game states. "
 }}
 
@@ -396,6 +425,7 @@ Format Rules:
         problem: str,
         custom_instruction: Optional[str] = None,
         insights_section: Optional[str] = None,
+        image: Optional[Any] = None,
     ) -> Dict:
         """Step 1: Generate solution using Solution Prompt
 
@@ -403,17 +433,24 @@ Format Rules:
             problem: The problem to solve
             custom_instruction: Optional custom instruction to append to the prompt
             insights_section: Pre-formatted insights section (from caller)
+            image: Optional image to ground the solution-generation call.
         """
         prompt = self._get_solution_prompt(
             problem,
             custom_instruction=custom_instruction,
             insights_section=insights_section,
         )
+        if image is not None:
+            prompt = (
+                "An image is attached to this problem. Use both the image and "
+                "the question text; do not ignore visual evidence.\n\n" + prompt
+            )
 
         system_prompt = None
         response, token_info = self._call_model(
-            prompt, system_prompt, max_new_tokens=32768
+            prompt, system_prompt, max_new_tokens=32768, image=image
         )
+        self._require_nonempty_text(response, "Solution")
         print(f"Solution Response: {response}")
 
         # Log token usage for Step 1
@@ -436,10 +473,11 @@ Format Rules:
         prompt = self._get_reflection_prompt(problem, solution)
 
         system_prompt = None
-        # Step 2: Use 4096 tokens for reflection (needs more tokens for detailed critique)
+        # Appendix C of the paper sets the reflection limit to 16,384 tokens.
         response, token_info = self._call_model(
-            prompt, system_prompt, max_new_tokens=4096
+            prompt, system_prompt, max_new_tokens=16384
         )
+        self._require_nonempty_text(response, "Solution reflection")
         print(f"Reflection Response: {response}")
 
         step_result = {
@@ -461,8 +499,9 @@ Format Rules:
 
         system_prompt = None
         response, token_info = self._call_model(
-            prompt, system_prompt, max_new_tokens=32768
+            prompt, system_prompt, max_new_tokens=8192
         )
+        self._require_nonempty_text(response, "Reasoning-trace extraction response")
         print(f"Skill Extraction Response: {response}")
 
         # Simple JSON extraction: parse skills from JSON format
@@ -524,9 +563,11 @@ Format Rules:
 
                     if isinstance(json_data, dict):
                         for insight_name, insight_desc in json_data.items():
-                            # Ensure skill name starts with insight_
-                            if not insight_name.startswith("insight_"):
-                                insight_name = f"insight_{insight_name}"
+                            # Prompt 3 in the paper names uploaded local artifacts
+                            # with trace_. Preserve that schema instead of silently
+                            # rewriting trace_ names into insight_trace_ names.
+                            if not insight_name.startswith(("trace_", "insight_")):
+                                insight_name = f"trace_{insight_name}"
 
                             # Convert to string and normalize
                             if isinstance(insight_desc, dict):
@@ -557,8 +598,10 @@ Format Rules:
             if not skills:
                 print("Warning: JSON parsing failed. Attempting regex extraction.")
                 # Extract insight_name: "description" patterns
-                insight_pattern = r'"insight_\w+"\s*:\s*"((?:[^"\\]|\\.)*)"'
-                name_pattern = r'"insight_\w+"'
+                insight_pattern = (
+                    r'"(?:trace|insight)_\w+"\s*:\s*"((?:[^"\\]|\\.)*)"'
+                )
+                name_pattern = r'"(?:trace|insight)_\w+"'
                 names = re.findall(name_pattern, response)
                 descriptions = re.findall(insight_pattern, response)
 
@@ -582,12 +625,12 @@ Format Rules:
         # Filter valid skills
         valid_skills = {}
         for k, v in skills.items():
-            if not k.startswith("insight_"):
+            if not k.startswith(("trace_", "insight_")):
                 continue
             if isinstance(v, str) and len(v.strip()) >= 20:
                 valid_skills[k] = v
         if not valid_skills:
-            print("WARNING: No valid skills extracted from this problem!")
+            raise ValueError("Reasoning traces are empty: no valid traces were extracted.")
 
         # Report validation results
         if validation_errors:
@@ -618,6 +661,7 @@ Format Rules:
         task: Optional[str] = None,
         custom_solution_instruction: Optional[str] = None,
         insights_section: Optional[str] = None,
+        image: Optional[Any] = None,
     ) -> Dict:
         """
         Solve a problem and extract skills using the behavior curation pipeline.
@@ -628,6 +672,7 @@ Format Rules:
                  If None, uses the default task.
             custom_solution_instruction: Optional custom instruction to append to step 1 prompt
             insights_section: Pre-formatted insights section string (from caller)
+            image: Optional image supplied only to the solution-generation stage.
 
         Returns:
             Dictionary containing solution, reflection, extracted skills, and insight book.
@@ -650,6 +695,7 @@ Format Rules:
             problem,
             custom_instruction=custom_solution_instruction,
             insights_section=insights_section,
+            image=image,
         )
         solution = step1["response"]
         time.sleep(1)
@@ -671,7 +717,7 @@ Format Rules:
             self.insight_book.update(extracted_insights)
             print(f"Added {len(extracted_insights)} insights to insight book")
         else:
-            print("WARNING: No skills extracted from this problem!")
+            raise ValueError("Reasoning traces are empty: no insights were produced.")
 
         # Compile results
         result = {
@@ -710,8 +756,7 @@ Format Rules:
 
         insight_book = reasoning_result.get("insight_book", {})
         if not insight_book:
-            print("No skills to save")
-            return
+            raise ValueError("Reasoning traces are empty: no insight book can be saved.")
 
         if output_path is None:
             # Create a safe filename from the problem/question
@@ -779,6 +824,15 @@ if __name__ == "__main__":
         help="API key for the chosen provider (or set GEMINI_API_KEY / OPENROUTER_API_KEY env var)",
     )
     parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help=(
+            "Provider model name. OpenRouter example: "
+            "google/gemini-2.5-flash-lite."
+        ),
+    )
+    parser.add_argument(
         "-o",
         "--output",
         type=str,
@@ -802,6 +856,7 @@ if __name__ == "__main__":
         use_api=args.use_api,
         api_key=args.api_key,
         api_provider=args.api_provider,
+        api_model=args.api_model,
         output_dir=args.output,
         load_in_8bit=args.load_in_8bit,
     )
