@@ -1,6 +1,8 @@
 """
-Check ICLR Accept (Oral) papers for insight guidance using Gemini or OpenRouter API.
-- Fetches ICLR papers for a given year directly from OpenReview API.
+Check accepted ICLR papers for insight guidance using Gemini or OpenRouter API.
+- Preferentially reads metadata and papers from a local scraper corpus.
+- Keeps OpenReview/proceedings access only as a legacy fallback when no local
+  --papers-dir is supplied.
 - Uses a provided insights encyclopedia (JSON mapping of name->description or plain text) as guidance.
 - Sends title + abstract + insights to the API and records which insights apply.
 - Outputs a summary count (guided/total) and a JSON report with per-paper results.
@@ -24,13 +26,20 @@ Usage example:
 """
 
 import argparse
+import concurrent.futures
 import glob
+import hashlib
 import json
+import logging
 import os
+import random
 import re
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -155,67 +164,376 @@ class GeminiClient:
 
 
 class OpenRouterClient:
-    def __init__(self, api_key: str, model_name: str = "openai/gpt-4o"):
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "openai/gpt-4o",
+        request_timeout: float = 300.0,
+    ):
         self.api_key = api_key
         self.model_name = model_name
         self.base_url = "https://openrouter.ai/api/v1"
+        self.batch_url = "https://openrouter.ai/api/beta/batches"
+        self.request_timeout = request_timeout
 
-    def generate_text(self, prompt: str, max_output_tokens: int = 16384) -> Tuple[str, Dict]:
-        """Generate text using OpenRouter API and return (text, token_info) tuple."""
-        import requests
-        
-        headers = {
+    def _headers(self) -> Dict[str, str]:
+        return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/dixiyao/Federation-of-Text",
             "X-Title": "ICLR Insight Checker",
         }
+
+    def generate_text(self, prompt: str, max_output_tokens: int = 16384) -> Tuple[str, Dict]:
+        """Generate text using OpenRouter API and return (text, token_info) tuple."""
+        import requests
         
         data = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_output_tokens,
+            "reasoning": {"enabled": False},
         }
         
-        max_retries = 5
+        max_retries = 6
         base_delay = 1.0  # Start with 1 second
         
         for attempt in range(max_retries):
             try:
                 response = requests.post(
                     f"{self.base_url}/chat/completions",
-                    headers=headers,
+                    headers=self._headers(),
                     json=data,
-                    timeout=60
+                    timeout=self.request_timeout,
                 )
                 response.raise_for_status()
                 
                 result = response.json()
                 if "choices" in result and len(result["choices"]) > 0:
                     text = result["choices"][0]["message"]["content"].strip()
-                    output_tokens = result.get("usage", {}).get("completion_tokens", 0)
-                    return text, {"output_tokens": output_tokens}
+                    usage = result.get("usage", {})
+                    return text, {
+                        "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+                        "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                    }
                 else:
                     raise RuntimeError("Failed to extract text from OpenRouter response")
                     
             except requests.exceptions.HTTPError as e:
-                if response.status_code == 429:  # Too Many Requests
+                try:
+                    error_detail = response.json()
+                except Exception:
+                    error_detail = response.text[:2000]
+                if (
+                    response.status_code == 429
+                    or response.status_code >= 500
+                ):
                     if attempt < max_retries - 1:  # Don't sleep on the last attempt
-                        delay = base_delay * (2 ** attempt)  # Exponential backoff
-                        print(f"    Rate limited (429). Retrying in {delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})")
+                        retry_after = response.headers.get("Retry-After")
+                        if not retry_after and isinstance(error_detail, dict):
+                            metadata = error_detail.get("error", {}).get(
+                                "metadata", {}
+                            )
+                            if isinstance(metadata, dict):
+                                retry_after = metadata.get("headers", {}).get(
+                                    "Retry-After"
+                                )
+                        try:
+                            requested_delay = float(retry_after)
+                        except (TypeError, ValueError):
+                            requested_delay = 0.0
+                        delay = max(requested_delay, base_delay * (2 ** attempt))
+                        delay += random.uniform(0.0, min(5.0, delay * 0.1))
+                        print(
+                            f"    OpenRouter HTTP {response.status_code}. Retrying in "
+                            f"{delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})"
+                        )
                         time.sleep(delay)
                         continue
                     else:
-                        print(f"    Rate limited (429). Max retries exceeded.")
-                        raise e
+                        print(
+                            f"    OpenRouter HTTP {response.status_code}. "
+                            "Max retries exceeded."
+                        )
+                        raise RuntimeError(
+                            f"OpenRouter HTTP {response.status_code} for model "
+                            f"{self.model_name}: {error_detail}"
+                        ) from e
                 else:
-                    # For other HTTP errors, don't retry
-                    raise e
-            except Exception as e:
-                # For non-HTTP errors, don't retry
-                raise e
+                    hint = (
+                        " The model may be retired or unavailable; verify it in "
+                        "https://openrouter.ai/api/v1/models."
+                        if response.status_code == 404
+                        else ""
+                    )
+                    raise RuntimeError(
+                        f"OpenRouter HTTP {response.status_code} for model "
+                        f"{self.model_name}: {error_detail}.{hint}"
+                    ) from e
+            except requests.exceptions.RequestException:
+                if attempt >= max_retries - 1:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                print(
+                    f"    OpenRouter connection error. Retrying in {delay:.1f} "
+                    f"seconds... (attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
         
         raise RuntimeError(f"Failed after {max_retries} attempts")
+
+    def generate_text_batch(
+        self,
+        requests_to_run: Sequence[Tuple[str, str]],
+        max_output_tokens: int,
+        poll_interval: float,
+        state_path: str,
+    ) -> Dict[str, Tuple[str, Dict]]:
+        """Submit or resume an OpenRouter asynchronous text batch.
+
+        The returned mapping is keyed by the caller-provided custom request ID.
+        A small state file preserves the remote batch ID, allowing a rerun to
+        resume polling rather than submitting and paying for the batch twice.
+        """
+        if not requests_to_run:
+            return {}
+
+        request_ids = [custom_id for custom_id, _ in requests_to_run]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("OpenRouter batch custom IDs must be unique")
+
+        fingerprint_payload = {
+            "model": self.model_name,
+            "max_output_tokens": max_output_tokens,
+            "requests": requests_to_run,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        batch_id = None
+        if os.path.exists(state_path):
+            with open(state_path, encoding="utf-8") as handle:
+                state = json.load(handle)
+            if state.get("fingerprint") != fingerprint:
+                raise RuntimeError(
+                    f"Existing batch state {state_path} belongs to different "
+                    "inputs. Remove or rename it before submitting a new batch."
+                )
+            batch_id = state.get("batch_id")
+            if batch_id:
+                print(f"Resuming OpenRouter batch {batch_id} from {state_path}")
+
+        if not batch_id:
+            # Keep endpoint and model before requests. OpenRouter stream-parses
+            # this payload and requires this top-level key order.
+            payload = {
+                "endpoint": "/v1/chat/completions",
+                "model": self.model_name,
+                "requests": [
+                    {
+                        "custom_id": custom_id,
+                        "body": {
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": max_output_tokens,
+                            "reasoning": {"enabled": False},
+                        },
+                    }
+                    for custom_id, prompt in requests_to_run
+                ],
+            }
+            print(
+                f"Submitting {len(requests_to_run)} requests as one OpenRouter "
+                f"batch with model {self.model_name}...",
+                flush=True,
+            )
+            response = requests.post(
+                self.batch_url,
+                headers=self._headers(),
+                data=json.dumps(payload, ensure_ascii=False),
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            batch = response.json()
+            batch_id = batch.get("id")
+            if not batch_id:
+                raise RuntimeError(
+                    f"OpenRouter batch submission returned no ID: {batch}"
+                )
+            os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "batch_id": batch_id,
+                        "fingerprint": fingerprint,
+                        "model": self.model_name,
+                        "request_count": len(requests_to_run),
+                    },
+                    handle,
+                    indent=2,
+                )
+            print(f"Submitted batch {batch_id}; state saved to {state_path}")
+
+        terminal_statuses = {"completed", "failed", "expired", "cancelled"}
+        last_progress = None
+        while True:
+            response = requests.get(
+                f"{self.batch_url}/{batch_id}",
+                headers=self._headers(),
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            batch = response.json()
+            status = batch.get("status")
+            counts = batch.get("request_counts") or {}
+            progress = (
+                status,
+                counts.get("completed", 0),
+                counts.get("failed", 0),
+                counts.get("total", len(requests_to_run)),
+            )
+            if progress != last_progress:
+                print(
+                    f"Batch {batch_id}: {progress[0]} "
+                    f"({progress[1]} completed, {progress[2]} failed, "
+                    f"{progress[3]} total)",
+                    flush=True,
+                )
+                last_progress = progress
+            if status in terminal_statuses:
+                break
+            time.sleep(max(poll_interval, 1.0))
+
+        if status != "completed":
+            raise RuntimeError(
+                f"OpenRouter batch {batch_id} ended with status={status}: "
+                f"{batch.get('error')}"
+            )
+
+        raw_results = batch.get("results")
+        if not isinstance(raw_results, list):
+            raise RuntimeError(
+                f"Completed OpenRouter batch {batch_id} returned no results"
+            )
+
+        parsed_results: Dict[str, Tuple[str, Dict]] = {}
+        failures = []
+        for item in raw_results:
+            custom_id = item.get("custom_id")
+            error = item.get("error")
+            response_item = item.get("response") or {}
+            status_code = response_item.get("status_code")
+            if error or status_code != 200:
+                failures.append(
+                    f"{custom_id}: status={status_code}, error={error}"
+                )
+                continue
+            body = response_item.get("body") or {}
+            choices = body.get("choices") or []
+            if not choices:
+                failures.append(f"{custom_id}: response contained no choices")
+                continue
+            content = choices[0].get("message", {}).get("content")
+            if not isinstance(content, str):
+                failures.append(f"{custom_id}: response content was not text")
+                continue
+            usage = body.get("usage") or {}
+            parsed_results[custom_id] = (
+                content.strip(),
+                {
+                    "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+                    "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                    "batch_id": batch_id,
+                },
+            )
+
+        missing = sorted(set(request_ids) - set(parsed_results))
+        if failures or missing:
+            preview = "; ".join(failures[:10])
+            raise RuntimeError(
+                f"OpenRouter batch {batch_id} had {len(missing)} unusable "
+                f"request(s). {preview}"
+            )
+        return parsed_results
+
+
+def _run_openrouter_batch_process(task):
+    """Submit and poll one OpenRouter batch inside an OS process."""
+    (
+        part_index,
+        api_key,
+        model_name,
+        request_timeout,
+        requests_to_run,
+        max_output_tokens,
+        poll_interval,
+        state_path,
+    ) = task
+    client = OpenRouterClient(
+        api_key=api_key,
+        model_name=model_name,
+        request_timeout=request_timeout,
+    )
+    results = client.generate_text_batch(
+        requests_to_run,
+        max_output_tokens=max_output_tokens,
+        poll_interval=poll_interval,
+        state_path=state_path,
+    )
+    return part_index, os.getpid(), results
+
+
+_CHECKER_JUDGE_CLIENT = None
+_CHECKER_JUDGE_PROMPTS: Optional[List[str]] = None
+_CHECKER_JUDGE_MAX_OUTPUT_TOKENS = 8
+_CHECKER_JUDGE_MAX_PAPER_CHARS = 20000
+
+
+def _initialize_checker_judge_process(
+    api_key: str,
+    model_name: str,
+    request_timeout: float,
+    encyclopedia_prompts: List[str],
+    max_output_tokens: int,
+    max_paper_chars: int,
+) -> None:
+    """Create one reusable OpenRouter judge client per OS process."""
+    global _CHECKER_JUDGE_CLIENT
+    global _CHECKER_JUDGE_PROMPTS
+    global _CHECKER_JUDGE_MAX_OUTPUT_TOKENS
+    global _CHECKER_JUDGE_MAX_PAPER_CHARS
+    _CHECKER_JUDGE_CLIENT = OpenRouterClient(
+        api_key=api_key,
+        model_name=model_name,
+        request_timeout=request_timeout,
+    )
+    _CHECKER_JUDGE_PROMPTS = encyclopedia_prompts
+    _CHECKER_JUDGE_MAX_OUTPUT_TOKENS = max_output_tokens
+    _CHECKER_JUDGE_MAX_PAPER_CHARS = max_paper_chars
+
+
+def _run_openrouter_judgment_process(task):
+    """Judge one paper/library pair and return its raw boolean response."""
+    if _CHECKER_JUDGE_CLIENT is None or _CHECKER_JUDGE_PROMPTS is None:
+        raise RuntimeError("OpenRouter judge process was not initialized")
+    enc_index, paper_index, paper = task
+    prompt = build_score_prompt(
+        _CHECKER_JUDGE_PROMPTS[enc_index],
+        paper,
+        _CHECKER_JUDGE_MAX_PAPER_CHARS,
+    )
+    raw, token_info = _CHECKER_JUDGE_CLIENT.generate_text(
+        prompt,
+        max_output_tokens=_CHECKER_JUDGE_MAX_OUTPUT_TOKENS,
+    )
+    verdict = parse_verdict_json(raw)
+    token_info = dict(token_info)
+    token_info["input_chars"] = len(prompt)
+    return enc_index, paper_index, raw, verdict, token_info, os.getpid()
 
 
 class LocalHFClient:
@@ -452,6 +770,104 @@ def find_encyclopedia_paths(encyclopedia_path: str) -> List[str]:
     raise FileNotFoundError(f"Encyclopedia path not found: {encyclopedia_path}")
 
 
+def _index_local_pdfs(papers_dir: Optional[str]) -> Dict[str, str]:
+    """Index scraper PDFs by their stable paper ID suffix."""
+    if not papers_dir or not os.path.isdir(papers_dir):
+        return {}
+    index: Dict[str, str] = {}
+    for path in Path(papers_dir).rglob("*.pdf"):
+        stem = path.stem
+        # scraper.py writes <safe-title>_<paper-id>.pdf. Also support a plain
+        # <paper-id>.pdf layout for manually prepared corpora.
+        candidates = [stem]
+        if "_" in stem:
+            candidates.append(stem.rsplit("_", 1)[-1])
+        for candidate in candidates:
+            index.setdefault(candidate, str(path))
+    return index
+
+
+def _load_local_accepted_papers(
+    papers_dir: Optional[str],
+    year: int,
+    max_papers: Optional[int],
+    accept_oral: bool,
+    accept_spotlight: bool,
+    accept_poster: bool,
+) -> List[Dict]:
+    """Load accepted-paper metadata and local PDF paths from a scraper corpus."""
+    if not papers_dir:
+        return []
+    metadata_path = os.path.join(papers_dir, "metadata.json")
+    if not os.path.isfile(metadata_path):
+        return []
+    try:
+        with open(metadata_path, encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read local paper metadata {metadata_path}: {exc}") from exc
+    if not isinstance(metadata, list):
+        raise ValueError(f"Local paper metadata must be a JSON list: {metadata_path}")
+
+    pdf_index = _index_local_pdfs(papers_dir)
+    all_tracks = accept_oral and accept_spotlight and accept_poster
+    papers: List[Dict] = []
+
+    def value(content: Dict, key: str, default=""):
+        result = content.get(key, default)
+        if isinstance(result, dict):
+            result = result.get("value", default)
+        return result
+
+    for raw in metadata:
+        if not isinstance(raw, dict):
+            continue
+        content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+        paper_id = str(raw.get("forum") or raw.get("id") or "").strip()
+        if not paper_id:
+            continue
+        venue = str(value(content, "venue", raw.get("venue", "")) or "")
+        track = str(raw.get("track") or "").lower()
+        track_text = f"{track} {venue}".lower()
+        if "oral" in track_text:
+            track = "oral"
+            include = accept_oral
+        elif "spotlight" in track_text:
+            track = "spotlight"
+            include = accept_spotlight
+        elif "poster" in track_text:
+            track = "poster"
+            include = accept_poster
+        else:
+            track = "conference"
+            include = all_tracks
+        if not include:
+            continue
+
+        local_pdf_path = pdf_index.get(paper_id)
+        papers.append(
+            {
+                "id": str(raw.get("id") or paper_id),
+                "forum": paper_id,
+                "title": str(value(content, "title", raw.get("title", "")) or ""),
+                "abstract": str(value(content, "abstract", raw.get("abstract", "")) or ""),
+                "venue": venue or f"ICLR {year} Conference",
+                "track": track,
+                "pdf_url": raw.get("pdf_url") or raw.get("pdf"),
+                "local_pdf_path": local_pdf_path,
+            }
+        )
+        if max_papers and len(papers) >= max_papers:
+            break
+
+    local_count = sum(bool(paper.get("local_pdf_path")) for paper in papers)
+    print(
+        f"Loaded {len(papers)} ICLR {year} papers from {metadata_path}; "
+        f"{local_count} local PDFs available."
+    )
+    return papers
+
+
 def fetch_accept_tracks(
     year: int,
     max_papers: int = None,
@@ -460,11 +876,38 @@ def fetch_accept_tracks(
     accept_poster: bool = False,
     or_username: str = None,
     or_password: str = None,
+    papers_dir: str = None,
 ) -> List[Dict]:
     """Fetch accepted papers using OpenReview client.
 
     Uses openreview-py to query ICLR submissions and filter by venue field.
     """
+    # A supplied local corpus is already the accepted-paper set, so no track
+    # flags means one overall evaluation across every paper. Keep the legacy
+    # network-mode default of oral-only for backward compatibility.
+    accept_any = accept_oral or accept_spotlight or accept_poster
+    if papers_dir and not accept_any:
+        accept_oral = accept_spotlight = accept_poster = True
+    else:
+        accept_oral = accept_oral or not accept_any
+
+    local_papers = _load_local_accepted_papers(
+        papers_dir,
+        year,
+        max_papers,
+        accept_oral,
+        accept_spotlight,
+        accept_poster,
+    )
+    if local_papers:
+        return local_papers
+    if papers_dir:
+        raise RuntimeError(
+            f"No accepted papers could be loaded from local corpus {papers_dir}. "
+            "Expected metadata.json and the already-downloaded paper files; "
+            "OpenReview fallback is disabled when --papers-dir is supplied."
+        )
+
     try:
         import openreview
 
@@ -473,11 +916,63 @@ def fetch_accept_tracks(
         use_or_client = False
         print("Warning: openreview-py not installed, falling back to requests")
 
-    # Default to oral if nothing specified (backward compatible)
-    accept_any = accept_oral or accept_spotlight or accept_poster
-    accept_oral = accept_oral or not accept_any
-
     decisions: List[Dict] = []
+    all_accept_tracks = accept_oral and accept_spotlight and accept_poster
+
+    def proceedings_fallback() -> List[Dict]:
+        if not all_accept_tracks:
+            return []
+        index_url = f"https://proceedings.iclr.cc/paper_files/paper/{year}"
+        print(
+            "Falling back to the official ICLR proceedings for all accepted "
+            f"papers: {index_url}"
+        )
+        try:
+            response = requests.get(index_url, timeout=120)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, "html.parser")
+            pattern = re.compile(
+                rf"/paper_files/paper/{year}/hash/"
+                r"([0-9a-f]+)-Abstract-Conference\.html$",
+                re.IGNORECASE,
+            )
+            papers = []
+            seen_ids = set()
+            for anchor in soup.find_all("a", href=True):
+                match = pattern.search(anchor["href"])
+                if not match:
+                    continue
+                paper_id = match.group(1).lower()
+                if paper_id in seen_ids:
+                    continue
+                title = anchor.get_text(" ", strip=True)
+                if not title:
+                    continue
+                seen_ids.add(paper_id)
+                papers.append(
+                    {
+                        "id": paper_id,
+                        "forum": paper_id,
+                        "title": title,
+                        "abstract": "",
+                        "venue": f"ICLR {year} Conference",
+                        "track": "conference",
+                        "pdf_url": (
+                            "https://proceedings.iclr.cc/paper_files/paper/"
+                            f"{year}/file/{paper_id}-Paper-Conference.pdf"
+                        ),
+                    }
+                )
+                if max_papers and len(papers) >= max_papers:
+                    break
+            print(
+                f"Found {len(papers)} accepted ICLR {year} papers via official "
+                "proceedings. Track-level labels are unavailable in this fallback."
+            )
+            return papers
+        except Exception as exc:
+            print(f"Official ICLR proceedings fallback failed: {exc}")
+            return []
 
     # Try OpenReview client first
     if use_or_client:
@@ -541,14 +1036,31 @@ def fetch_accept_tracks(
                 return decisions
             else:
                 print("No accepted papers found via client")
-                return []
+                return proceedings_fallback()
         except Exception as e:
             print(f"OpenReview client error: {e}")
-            return []
+            return proceedings_fallback()
 
     # Fallback: old requests-based approach
     print("Using requests-based fallback (may not work for ICLR 2024+)...")
-    return []
+    return proceedings_fallback()
+
+
+@contextmanager
+def _quiet_pdf_parser_diagnostics():
+    """Hide known non-fatal warnings emitted while recovering malformed PDFs."""
+    logger_names = ("pypdf", "PyPDF2", "pdfminer")
+    loggers = [logging.getLogger(name) for name in logger_names]
+    previous_levels = [logger.level for logger in loggers]
+    try:
+        for logger in loggers:
+            logger.setLevel(logging.CRITICAL)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        for logger, previous_level in zip(loggers, previous_levels):
+            logger.setLevel(previous_level)
 
 
 def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -561,12 +1073,13 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         import io
         import pypdf
-        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            if text.strip():
-                parts.append(text)
+        with _quiet_pdf_parser_diagnostics():
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            parts = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                if text.strip():
+                    parts.append(text)
         return "\n".join(parts)
     except ImportError:
         pass
@@ -577,7 +1090,8 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         import io
         from pdfminer.high_level import extract_text as pdfminer_extract
-        return pdfminer_extract(io.BytesIO(pdf_bytes))
+        with _quiet_pdf_parser_diagnostics():
+            return pdfminer_extract(io.BytesIO(pdf_bytes))
     except ImportError:
         pass
     except Exception as e:
@@ -591,6 +1105,9 @@ def _fetch_paper_content(
     session: requests.Session = None,
     or_client=None,
     cache_dir: str = "data/iclr25",
+    pdf_url: str = None,
+    local_pdf_path: str = None,
+    local_only: bool = False,
 ) -> str:
     """Fetch full paper content for scoring, with disk caching.
 
@@ -599,12 +1116,13 @@ def _fetch_paper_content(
 
     Strategy (in order):
       1. Return cached text if <cache_dir>/<forum_id>.txt exists.
-      2. Download PDF via authenticated OpenReview client and extract text.
-         This is the only reliable path for ICLR 2025+ where forum pages
-         require authentication.
-      3. Supplement with API metadata fields (abstract, keywords, etc.)
-         in case PDF extraction yields little text.
-      4. Fall back to unauthenticated HTML scrape for older years.
+      2. Extract a PDF supplied by the local scraper corpus.
+      3. If available, use an authenticated OpenReview client.
+      4. Otherwise, scrape the unauthenticated forum page (older years).
+
+    ``pdf_url`` and ``local_only`` are accepted for call compatibility but no
+    longer change behavior: there is no proceedings-PDF download and no
+    title/abstract-only shortcut.
 
     Returns paper text (up to 50k chars) or empty string.
     """
@@ -624,7 +1142,7 @@ def _fetch_paper_content(
             return cached
 
     # --- Check for local PDF files ---
-    local_pdf_paths = [
+    local_pdf_paths = ([local_pdf_path] if local_pdf_path else []) + [
         os.path.join("data", "papers", f"{forum_id}.pdf"),
         os.path.join("data", "papers", "iclr23_top5", f"{forum_id}.pdf"),
         os.path.join("data", "papers", "iclr23_diffusion", f"{forum_id}.pdf"),
@@ -738,18 +1256,61 @@ def _fetch_paper_content(
         return ""
 
 
+_CHECKER_PROCESS_SESSION = None
+
+
+def _initialize_checker_process() -> None:
+    """Create one reusable HTTP session inside each checker process."""
+    global _CHECKER_PROCESS_SESSION
+    _CHECKER_PROCESS_SESSION = requests.Session()
+    _CHECKER_PROCESS_SESSION.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36"
+            )
+        }
+    )
+
+
+def _prepare_paper_content_process(task):
+    """Load/extract one paper in a separate OS process."""
+    global _CHECKER_PROCESS_SESSION
+    if _CHECKER_PROCESS_SESSION is None:
+        _initialize_checker_process()
+    paper_index, forum_id, cache_dir, pdf_url, local_pdf_path, local_only = task
+    content = _fetch_paper_content(
+        forum_id,
+        _CHECKER_PROCESS_SESSION,
+        or_client=None,
+        cache_dir=cache_dir,
+        pdf_url=pdf_url,
+        local_pdf_path=local_pdf_path,
+        local_only=local_only,
+    )
+    return paper_index, content, os.getpid()
+
+
 def call_api(client, prompt: str, max_output_tokens: int = 16384) -> Tuple[str, Dict]:
     """Call API via wrapper and return (raw_text, token_info) tuple."""
     return client.generate_text(prompt, max_output_tokens=max_output_tokens)
 
 
 def parse_verdict_json(raw: str) -> Dict[str, Any]:
-    """Parse checker verdict JSON from chatty/reasoning model output."""
+    """Parse a boolean checker verdict, with legacy JSON compatibility."""
     text = raw.replace("Ġ", " ").replace("Ċ", "\n").strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s*```$", "", text).strip()
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+
+    # Current checker contract: exactly one lowercase boolean. Quoted forms
+    # are tolerated for provider compatibility, but prompts request bare text.
+    simple = text.strip().strip('"').strip("'").strip().lower()
+    if simple == "true":
+        return {"guided": True, "matched_insights": []}
+    if simple == "false":
+        return {"guided": False, "matched_insights": []}
 
     candidates = [text]
     for match in re.finditer(r"\{", text):
@@ -826,18 +1387,12 @@ def parse_verdict_json(raw: str) -> Dict[str, Any]:
     raise ValueError(f"Failed to parse verdict JSON: {last_error}; raw preview={raw[:500]}")
 
 
-def score_paper(
-    model: Any,
+def build_score_prompt(
     insights_prompt: str,
     paper: Dict,
-    max_output_tokens: int = 16384,
     max_paper_chars: int = 20000,
-) -> Tuple[Dict, Dict]:
-    """Ask Gemini which insights guide the paper's solutions.
-
-    Returns:
-        Tuple of (result_dict, token_info) where result_dict has guided/matched_insights
-    """
+) -> str:
+    """Build the strict boolean guidance-classification prompt."""
     title = paper.get("title", "")
     abstract = paper.get("abstract", "")
     content = paper.get("content", "")
@@ -848,11 +1403,10 @@ def score_paper(
         f"Title: {title}\n\nAbstract: {abstract}\n\nFull Paper Content: {content}"
     )
 
-    prompt = f"""
+    return f"""
 Classify whether the research paper's proposed solution is guided by or directly derived from any insight in the encyclopedia.
 
-You must output exactly this JSON schema and nothing else:
-{{"guided": false, "matched_insights": []}}
+Output exactly one lowercase word and nothing else: true or false.
 
 Insights:
 {insights_prompt}
@@ -866,22 +1420,33 @@ Evaluation Criteria - An insight guides the paper ONLY IF ALL of the following a
 
 2. METHODS SECTION PRESENCE: The insight must be related to how the paper actually implements its solution (methods, algorithms, techniques), not just in problem statement or related work.
 
-3. COUNTERFACTUAL TEST: The paper's core contribution would fundamentally differ or fail without this insight. Ask: "If the authors didn't know this insight, could they still arrive at the same core solution?"
-
-4. SPECIFICITY: The insight must specifically address a key challenge or component of the paper's solution, not just be generally applicable background knowledge.
+3. SPECIFICITY: The insight must specifically address a key challenge or component of the paper's solution, not just be generally applicable background knowledge.
 
 Response Format:
-- Respond ONLY in valid JSON with keys: guided (boolean), matched_insights (array of insight names)
-- Set guided=true ONLY when at least one insight passes ALL criteria above
-- Use only exact insight names from the Insights list above
-- Do not include markdown, comments, explanations, or Python-style booleans. Use JSON true/false.
-- If unsure, return {{"guided": false, "matched_insights": []}}.
+- Return true ONLY when at least one insight passes ALL criteria above.
+- Otherwise return false.
+- Do not return JSON, insight names, punctuation, markdown, explanation, or reasoning.
+- If unsure, return false.
 """
+
+
+def score_paper(
+    model: Any,
+    insights_prompt: str,
+    paper: Dict,
+    max_output_tokens: int = 8,
+    max_paper_chars: int = 20000,
+) -> Tuple[Dict, Dict]:
+    """Ask a model whether any encyclopedia insight guides the paper."""
+    prompt = build_score_prompt(insights_prompt, paper, max_paper_chars)
     print(
-        f"      Model input chars: insights={len(insights_prompt)} paper={len(paper_text)} max_output_tokens={max_output_tokens}",
+        f"      Model input chars: prompt={len(prompt)} max_output_tokens={max_output_tokens}",
         flush=True,
     )
     raw, token_info = call_api(model, prompt, max_output_tokens=max_output_tokens)
+    token_info = dict(token_info)
+    token_info["input_chars"] = len(prompt)
+    token_info["raw_response"] = raw
     print(
         f"      Model returned {len(raw)} chars; output_tokens={token_info.get('output_tokens', 0)}",
         flush=True,
@@ -938,14 +1503,54 @@ def main():
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        default=2048,
-        help="Maximum generated tokens per checker call (default: 2048).",
+        default=8,
+        help="Maximum generated tokens per boolean checker call (default: 8).",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=300.0,
+        help="Timeout in seconds for each OpenRouter request (default: 300)",
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help=(
+            "Submit all judge requests through OpenRouter's asynchronous Batch "
+            "API. Batch inputs are text-only and may take up to 24 hours."
+        ),
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between OpenRouter batch status polls (default: 60).",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Concurrent OS processes for paper text extraction and checker API "
+            "calls (default: 1). With --batch, every process submits and polls "
+            "an independent OpenRouter batch."
+        ),
     )
     parser.add_argument(
         "--max-paper-chars",
         type=int,
         default=20000,
         help="Maximum full-paper characters included in each checker prompt (default: 20000; use 0 for no truncation).",
+    )
+    parser.add_argument(
+        "--papers-dir",
+        type=str,
+        default=None,
+        help=(
+            "Local accepted-paper corpus created by scraper.py. Reads "
+            "metadata.json and PDFs locally before using any network fallback. "
+            "For year 2025, defaults to ICLR25_PAPERS when set."
+        ),
     )
     parser.add_argument(
         "--encyclopedia",
@@ -987,6 +1592,16 @@ def main():
         help="Output JSON file path",
     )
     parser.add_argument(
+        "--judgments-jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Append-only per-paper judgment journal. Defaults to "
+            "<output>.judgments.jsonl and is used to resume without paying "
+            "again for completed paper/library pairs."
+        ),
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=1.0,
@@ -996,18 +1611,34 @@ def main():
         "--or-username",
         type=str,
         default=None,
-        help="OpenReview account email (required for ICLR 2025+)",
+        help=(
+            "OpenReview account email for legacy network mode. Not used when "
+            "--papers-dir is supplied."
+        ),
     )
     parser.add_argument(
         "--or-password",
         type=str,
         default=None,
-        help="OpenReview account password (required for ICLR 2025+)",
+        help=(
+            "OpenReview password for legacy network mode. Not used when "
+            "--papers-dir is supplied."
+        ),
     )
 
     args = parser.parse_args()
+    args.or_username = args.or_username or os.getenv("OPENREVIEW_USERNAME")
+    args.or_password = args.or_password or os.getenv("OPENREVIEW_PASSWORD")
+    if not args.papers_dir and args.year == 2025:
+        args.papers_dir = os.getenv("ICLR25_PAPERS")
 
     use_local_model = args.api_type == "local" or bool(args.model)
+    if args.max_output_tokens < 1:
+        raise ValueError("--max-output-tokens must be at least 1")
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if args.batch and (args.api_type != "openrouter" or use_local_model):
+        raise ValueError("--batch is supported only with --api-type openrouter")
 
     if args.api_type == "openrouter":
         api_key = args.api_key or os.getenv("API_KEY") or os.getenv("OPENROUTER_API_KEY")
@@ -1033,7 +1664,11 @@ def main():
     elif args.api_type == "openrouter":
         # Use provided model or default to gpt-4o
         model_name = args.api_model if args.api_model != "gemini-3-pro-preview" else "openai/gpt-4o"
-        model = OpenRouterClient(api_key=api_key, model_name=model_name)
+        model = OpenRouterClient(
+            api_key=api_key,
+            model_name=model_name,
+            request_timeout=args.request_timeout,
+        )
         active_model_name = model_name
     else:
         raise ValueError(f"Unsupported API type: {args.api_type}")
@@ -1046,6 +1681,7 @@ def main():
         accept_poster=args.accept_poster,
         or_username=args.or_username,
         or_password=args.or_password,
+        papers_dir=args.papers_dir,
     )
     if not papers:
         print("No Accept papers found.")
@@ -1053,18 +1689,18 @@ def main():
 
     encyclopedia_paths = find_encyclopedia_paths(args.encyclopedia)
     print(f"\nFound {len(encyclopedia_paths)} encyclopedia file(s) to evaluate.", flush=True)
-    print(f"Processing {len(papers)} papers (sorted: oral → spotlight → poster)...\n", flush=True)
-
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        }
-    )
+    print(f"Processing {len(papers)} accepted papers as one overall set...\n", flush=True)
 
     # Build authenticated OpenReview client for content fetching (ICLR 2025+)
     or_client = None
-    if args.or_username and args.or_password:
+    proceedings_only = bool(papers) and all(
+        paper.get("local_pdf_path") or paper.get("pdf_url") for paper in papers
+    )
+    if proceedings_only:
+        print(
+            "Using official proceedings PDFs; skipping a second OpenReview login."
+        )
+    elif args.or_username and args.or_password:
         try:
             import openreview
             or_client = openreview.api.OpenReviewClient(
@@ -1080,117 +1716,523 @@ def main():
     encyclopedias_data = []
     for enc_path in encyclopedia_paths:
         insights, insights_prompt = load_insights(enc_path)
+        with open(enc_path, "rb") as encyclopedia_file:
+            encyclopedia_sha256 = hashlib.sha256(encyclopedia_file.read()).hexdigest()
         encyclopedias_data.append({
             'path': enc_path,
+            'sha256': encyclopedia_sha256,
             'insights': insights,
             'prompt': insights_prompt,
             'results': [],
             'track_stats': {
                 "oral": {"total": 0, "guided": 0},
                 "spotlight": {"total": 0, "guided": 0},
-                "poster": {"total": 0, "guided": 0}
+                "poster": {"total": 0, "guided": 0},
+                "conference": {"total": 0, "guided": 0},
             }
         })
 
-    print("\nFetching and evaluating paper contents...", flush=True)
-    for idx, paper in enumerate(papers, 1):
-        track_label = paper.get("track", "")
-        forum_id = paper.get("forum") or paper.get("id")
+    print(
+        f"\nFetching paper contents with {args.num_workers} worker(s)...",
+        flush=True,
+    )
+    cache_dir = (
+        os.path.join(args.papers_dir, "text_cache")
+        if args.papers_dir
+        else "data/iclr25"
+    )
+    if args.num_workers > 1 and or_client is not None:
+        raise ValueError(
+            "Multiprocess paper preparation cannot share an authenticated "
+            "OpenReview client. Use --papers-dir with local PDFs (recommended), "
+            "use proceedings PDF URLs, or set --num-workers 1."
+        )
 
+    preparation_tasks = [
+        (
+            paper_index,
+            paper.get("forum") or paper.get("id"),
+            cache_dir,
+            paper.get("pdf_url"),
+            paper.get("local_pdf_path"),
+            bool(args.papers_dir),
+        )
+        for paper_index, paper in enumerate(papers)
+    ]
+    if args.num_workers == 1:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36"
+                )
+            }
+        )
+        prepared_outputs = []
+        for paper_index, paper in enumerate(papers):
+            paper_content = _fetch_paper_content(
+                paper.get("forum") or paper.get("id"),
+                session,
+                or_client=or_client,
+                cache_dir=cache_dir,
+                pdf_url=paper.get("pdf_url"),
+                local_pdf_path=paper.get("local_pdf_path"),
+                local_only=bool(args.papers_dir),
+            )
+            prepared_outputs.append((paper_index, paper_content, os.getpid()))
+    else:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=_initialize_checker_process,
+        ) as executor:
+            prepared_outputs = list(
+                executor.map(_prepare_paper_content_process, preparation_tasks)
+            )
+
+    for completed, (returned_index, paper_content, worker_pid) in enumerate(
+        prepared_outputs, 1
+    ):
+        papers[returned_index]["content"] = paper_content
+        content_status = (
+            f"{len(paper_content)} characters"
+            if paper_content
+            else "title/abstract fallback"
+        )
         print(
-            f"[{idx}/{len(papers)}] Fetching content for ({track_label}): {paper.get('title', '')[:80]}",
+            f"[{completed}/{len(papers)}] Prepared "
+            f"{papers[returned_index].get('title', '')[:80]} "
+            f"({content_status}) in PID {worker_pid}",
             flush=True,
         )
-        paper_content = _fetch_paper_content(forum_id, session, or_client=or_client)
-        paper["content"] = paper_content
-        if paper_content:
-            print(f"  Retrieved {len(paper_content)} characters", flush=True)
-        else:
-            print(f"  No full content available, using title/abstract only", flush=True)
 
-        # Evaluate against all encyclopedias
-        for enc_data in encyclopedias_data:
-            print(f"    Evaluating with encyclopedia {os.path.basename(enc_data['path'])} and model {active_model_name}...", flush=True)
-            output_tokens = 0
-            try:
-                verdict, token_info = score_paper(
-                    model,
-                    enc_data['prompt'],
-                    paper,
-                    max_output_tokens=args.max_output_tokens,
-                    max_paper_chars=args.max_paper_chars,
+    judgment_log_path = args.judgments_jsonl or f"{args.output}.judgments.jsonl"
+    os.makedirs(os.path.dirname(judgment_log_path) or ".", exist_ok=True)
+    completed_result_keys = set()
+
+    def result_key(enc_data: Dict[str, Any], paper: Dict[str, Any]) -> str:
+        paper_key = str(paper.get("forum") or paper.get("id") or "")
+        return f"{active_model_name}|{enc_data['sha256']}|{paper_key}"
+
+    def update_track_stats(
+        enc_data: Dict[str, Any], track_label: str, guided: bool
+    ) -> None:
+        if track_label in enc_data["track_stats"]:
+            enc_data["track_stats"][track_label]["total"] += 1
+            if guided:
+                enc_data["track_stats"][track_label]["guided"] += 1
+
+    # Recover completed judgments before making any new paid API calls. Keep
+    # the latest valid occurrence of a key if a manually concatenated journal
+    # contains duplicates.
+    recovered_by_key: Dict[str, Dict[str, Any]] = {}
+    if os.path.isfile(judgment_log_path):
+        with open(judgment_log_path, encoding="utf-8") as judgment_log:
+            for line_number, line in enumerate(judgment_log, 1):
+                if not line.strip():
+                    continue
+                try:
+                    recovered = json.loads(line)
+                except json.JSONDecodeError:
+                    print(
+                        f"Warning: ignoring malformed judgment journal line "
+                        f"{line_number}: {judgment_log_path}",
+                        flush=True,
+                    )
+                    continue
+                recovered_key = recovered.get("result_key")
+                if recovered_key and isinstance(recovered.get("guided"), bool):
+                    recovered_by_key[recovered_key] = recovered
+
+    paper_by_key = {
+        str(paper.get("forum") or paper.get("id") or ""): paper
+        for paper in papers
+    }
+    paper_index_by_key = {
+        str(paper.get("forum") or paper.get("id") or ""): paper_index
+        for paper_index, paper in enumerate(papers)
+    }
+    encyclopedia_by_sha = {
+        enc_data["sha256"]: enc_data for enc_data in encyclopedias_data
+    }
+    for recovered_key, recovered in recovered_by_key.items():
+        if recovered.get("judge_model") != active_model_name:
+            continue
+        enc_data = encyclopedia_by_sha.get(recovered.get("encyclopedia_sha256"))
+        paper = paper_by_key.get(str(recovered.get("paper_key") or ""))
+        if enc_data is None or paper is None:
+            continue
+        expected_key = result_key(enc_data, paper)
+        if recovered_key != expected_key:
+            continue
+        completed_result_keys.add(recovered_key)
+        enc_data["results"].append(recovered)
+        update_track_stats(
+            enc_data,
+            str(recovered.get("track") or ""),
+            bool(recovered["guided"]),
+        )
+
+    if completed_result_keys:
+        print(
+            f"Recovered {len(completed_result_keys)} completed per-paper "
+            f"judgments from {judgment_log_path}.",
+            flush=True,
+        )
+    # A hard process interruption can leave a partial final JSONL line. It was
+    # ignored above; terminate it before appending so every subsequent record
+    # remains independently parseable.
+    if os.path.isfile(judgment_log_path) and os.path.getsize(judgment_log_path) > 0:
+        with open(judgment_log_path, "rb+") as interrupted_log:
+            interrupted_log.seek(-1, os.SEEK_END)
+            if interrupted_log.read(1) != b"\n":
+                interrupted_log.write(b"\n")
+    judgment_log = open(judgment_log_path, "a", encoding="utf-8")
+
+    def record_result(
+        enc_data: Dict[str, Any],
+        paper: Dict[str, Any],
+        verdict: Dict[str, Any],
+        token_info: Dict[str, Any],
+        raw_response: str,
+    ) -> None:
+        key = result_key(enc_data, paper)
+        if key in completed_result_keys:
+            return
+        guided = bool(verdict.get("guided"))
+        track_label = paper.get("track", "")
+        update_track_stats(enc_data, track_label, guided)
+        paper_key = str(paper.get("forum") or paper.get("id") or "")
+        result = {
+            "schema_version": 1,
+            "result_key": key,
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "judge_model": active_model_name,
+            "setting": os.path.basename(
+                os.path.dirname(os.path.abspath(enc_data["path"]))
+            ),
+            "encyclopedia": os.path.basename(enc_data["path"]),
+            "encyclopedia_path": os.path.abspath(enc_data["path"]),
+            "encyclopedia_sha256": enc_data["sha256"],
+            "paper_key": paper_key,
+            "paper_index": paper_index_by_key[paper_key],
+            "id": paper.get("id"),
+            "forum": paper.get("forum"),
+            "title": paper.get("title", ""),
+            "guided": guided,
+            "judgment": "true" if guided else "false",
+            "judgment_value": 1 if guided else 0,
+            "raw_response": str(raw_response),
+            # Boolean-only judging intentionally does not ask the model to
+            # repeat insight names, minimizing completion-token charges.
+            "matched_insights": [],
+            "track": track_label,
+            "venue": paper.get("venue", ""),
+            "venueid": paper.get("venueid", ""),
+            "input_chars": int(token_info.get("input_chars", 0) or 0),
+            "input_tokens": int(token_info.get("input_tokens", 0) or 0),
+            "output_tokens": int(token_info.get("output_tokens", 0) or 0),
+        }
+        if token_info.get("batch_id"):
+            result["batch_id"] = token_info["batch_id"]
+        enc_data["results"].append(result)
+        completed_result_keys.add(key)
+        judgment_log.write(json.dumps(result, ensure_ascii=False) + "\n")
+        judgment_log.flush()
+
+    if args.batch:
+        batch_requests: List[Tuple[str, str]] = []
+        request_targets: Dict[str, Tuple[int, int]] = {}
+        for enc_index, enc_data in enumerate(encyclopedias_data):
+            for paper_index, paper in enumerate(papers):
+                if result_key(enc_data, paper) in completed_result_keys:
+                    continue
+                custom_id = f"enc-{enc_index:04d}-paper-{paper_index:06d}"
+                prompt = build_score_prompt(
+                    enc_data["prompt"], paper, args.max_paper_chars
                 )
-                guided = bool(verdict.get("guided"))
-                matched = verdict.get("matched_insights") or []
-                output_tokens = token_info.get("output_tokens", 0)
+                batch_requests.append((custom_id, prompt))
+                request_targets[custom_id] = (enc_index, paper_index)
+
+        api_processes = min(args.num_workers, len(batch_requests)) if batch_requests else 0
+        chunk_size = (
+            (len(batch_requests) + api_processes - 1) // api_processes
+            if api_processes
+            else 0
+        )
+        batch_process_tasks = []
+        offsets = range(0, len(batch_requests), chunk_size) if chunk_size else []
+        for part_index, offset in enumerate(offsets):
+            request_chunk = batch_requests[offset : offset + chunk_size]
+            state_path = (
+                f"{args.output}.batch_state.json"
+                if api_processes == 1
+                else f"{args.output}.batch_part_{part_index:04d}_state.json"
+            )
+            batch_process_tasks.append(
+                (
+                    part_index,
+                    api_key,
+                    active_model_name,
+                    args.request_timeout,
+                    request_chunk,
+                    args.max_output_tokens,
+                    args.batch_poll_interval,
+                    state_path,
+                )
+            )
+
+        print(
+            f"\nBatch-evaluating {len(batch_requests)} paper/library pairs "
+            f"with {active_model_name} across {api_processes} API process(es); "
+            f"each response is capped at {args.max_output_tokens} tokens.",
+            flush=True,
+        )
+        if not batch_requests:
+            batch_process_outputs = []
+        elif api_processes == 1:
+            batch_process_outputs = [
+                _run_openrouter_batch_process(batch_process_tasks[0])
+            ]
+        else:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=api_processes
+            ) as executor:
+                batch_process_outputs = list(
+                    executor.map(
+                        _run_openrouter_batch_process,
+                        batch_process_tasks,
+                    )
+                )
+
+        batch_results = {}
+        for part_index, worker_pid, part_results in batch_process_outputs:
+            overlap = set(batch_results).intersection(part_results)
+            if overlap:
+                raise RuntimeError(
+                    f"Duplicate checker result IDs across batch part {part_index}: "
+                    f"{sorted(overlap)[:5]}"
+                )
+            batch_results.update(part_results)
+            print(
+                f"API process PID {worker_pid} completed batch part "
+                f"{part_index} ({len(part_results)} judgments)",
+                flush=True,
+            )
+        for custom_id, prompt in batch_requests:
+            enc_index, paper_index = request_targets[custom_id]
+            raw, token_info = batch_results[custom_id]
+            token_info = dict(token_info)
+            token_info["input_chars"] = len(prompt)
+            try:
+                verdict = parse_verdict_json(raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Invalid boolean verdict for {custom_id}: {raw!r}"
+                ) from exc
+            record_result(
+                encyclopedias_data[enc_index],
+                papers[paper_index],
+                verdict,
+                token_info,
+                raw,
+            )
+    else:
+        pending_judgments = [
+            (enc_index, paper_index, paper)
+            for enc_index, enc_data in enumerate(encyclopedias_data)
+            for paper_index, paper in enumerate(papers)
+            if result_key(enc_data, paper) not in completed_result_keys
+        ]
+        if (
+            args.api_type == "openrouter"
+            and not use_local_model
+            and args.num_workers > 1
+            and pending_judgments
+        ):
+            worker_count = min(args.num_workers, len(pending_judgments))
+            print(
+                f"\nEvaluating {len(pending_judgments)} remaining judgments "
+                f"with {worker_count} OpenRouter API process(es)...",
+                flush=True,
+            )
+            failures = []
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_initialize_checker_judge_process,
+                initargs=(
+                    api_key,
+                    active_model_name,
+                    args.request_timeout,
+                    [enc_data["prompt"] for enc_data in encyclopedias_data],
+                    args.max_output_tokens,
+                    args.max_paper_chars,
+                ),
+            ) as executor:
+                future_to_target = {
+                    executor.submit(_run_openrouter_judgment_process, task): (
+                        task[0],
+                        task[1],
+                    )
+                    for task in pending_judgments
+                }
+                for completed, future in enumerate(
+                    concurrent.futures.as_completed(future_to_target), 1
+                ):
+                    enc_index, paper_index = future_to_target[future]
+                    try:
+                        (
+                            returned_enc_index,
+                            returned_paper_index,
+                            raw,
+                            verdict,
+                            token_info,
+                            worker_pid,
+                        ) = future.result()
+                    except Exception as exc:
+                        failures.append((enc_index, paper_index, exc))
+                        print(
+                            f"[{completed}/{len(pending_judgments)}] API/model "
+                            f"error for paper {paper_index}: {exc}",
+                            flush=True,
+                        )
+                        continue
+                    record_result(
+                        encyclopedias_data[returned_enc_index],
+                        papers[returned_paper_index],
+                        verdict,
+                        token_info,
+                        raw,
+                    )
+                    print(
+                        f"[{completed}/{len(pending_judgments)}] PID {worker_pid}: "
+                        f"{'true' if verdict.get('guided') else 'false'} for "
+                        f"paper {returned_paper_index + 1}",
+                        flush=True,
+                    )
+            if failures:
+                judgment_log.flush()
+                judgment_log.close()
+                preview = "; ".join(
+                    f"paper {paper_index + 1}: {error}"
+                    for _, paper_index, error in failures[:10]
+                )
+                raise RuntimeError(
+                    f"{len(failures)} judgment(s) failed and were not recorded "
+                    f"as false. Completed results are saved in "
+                    f"{judgment_log_path}. First failures: {preview}"
+                )
+        else:
+            print(
+                f"\nEvaluating {len(pending_judgments)} remaining judgments "
+                "synchronously...",
+                flush=True,
+            )
+            for enc_index, paper_index, paper in pending_judgments:
+                enc_data = encyclopedias_data[enc_index]
                 print(
-                    f"    Result: {'✓ GUIDED' if guided else '✗ Not guided'} | Insights: {len(matched)} | Tokens: {output_tokens}",
+                    f"[{paper_index + 1}/{len(papers)}] Evaluating with encyclopedia "
+                    f"{os.path.basename(enc_data['path'])} and model "
+                    f"{active_model_name}...",
                     flush=True,
                 )
-            except Exception as exc:
-                print(f"    API/model error: {exc}", flush=True)
-                guided = False
-                matched = []
+                try:
+                    verdict, token_info = score_paper(
+                        model,
+                        enc_data["prompt"],
+                        paper,
+                        max_output_tokens=args.max_output_tokens,
+                        max_paper_chars=args.max_paper_chars,
+                    )
+                except Exception as exc:
+                    print(f"    API/model error: {exc}", flush=True)
+                    raise RuntimeError(
+                        "Aborting instead of recording an API/model failure as an "
+                        "unguided paper. The output would otherwise contain biased "
+                        "false negatives."
+                    ) from exc
+                raw_response = str(token_info.pop("raw_response", ""))
+                record_result(
+                    enc_data,
+                    paper,
+                    verdict,
+                    token_info,
+                    raw_response,
+                )
+                print(
+                    f"    Result: {'✓ GUIDED' if verdict.get('guided') else '✗ Not guided'} "
+                    f"| Tokens: {token_info.get('output_tokens', 0)}",
+                    flush=True,
+                )
+                time.sleep(max(args.sleep, 0))
 
-            if track_label in enc_data['track_stats']:
-                enc_data['track_stats'][track_label]["total"] += 1
-                if guided:
-                    enc_data['track_stats'][track_label]["guided"] += 1
-
-            enc_data['results'].append(
-                {
-                    "id": paper.get("id"),
-                    "forum": paper.get("forum"),
-                    "title": paper.get("title", ""),
-                    "guided": guided,
-                    "matched_insights": matched,
-                    "track": paper.get("track", ""),
-                    "venue": paper.get("venue", ""),
-                    "venueid": paper.get("venueid", ""),
-                    "output_tokens": output_tokens,
-                }
-            )
-            time.sleep(max(args.sleep, 0))
+    judgment_log.flush()
+    judgment_log.close()
 
     # Build evaluations from the collected data
     evaluations = []
+    expected_paper_keys = [
+        str(paper.get("forum") or paper.get("id") or "") for paper in papers
+    ]
+    paper_order = {
+        paper_key: index for index, paper_key in enumerate(expected_paper_keys)
+    }
     for enc_data in encyclopedias_data:
         total = len(papers)
+        observed_paper_keys = [
+            str(result.get("paper_key") or "") for result in enc_data["results"]
+        ]
+        if (
+            len(observed_paper_keys) != total
+            or len(set(observed_paper_keys)) != total
+            or set(observed_paper_keys) != set(expected_paper_keys)
+        ):
+            raise RuntimeError(
+                f"Incomplete or duplicate per-paper judgment log for "
+                f"{enc_data['path']}: expected {total} unique papers, received "
+                f"{len(observed_paper_keys)} records. Durable partial results "
+                f"remain in {judgment_log_path}."
+            )
+        enc_data["results"].sort(
+            key=lambda result: paper_order[str(result.get("paper_key") or "")]
+        )
         total_guided = sum(enc_data['track_stats'][t]["guided"] for t in enc_data['track_stats'])
         guidance_rate = total_guided / total if total else 0.0
 
         evaluation = {
+            "judge_model": active_model_name,
             "encyclopedia": os.path.basename(enc_data['path']),
             "path": enc_data['path'],
+            "encyclopedia_sha256": enc_data["sha256"],
+            "judgments_jsonl": judgment_log_path,
             "metrics": {
                 "total_papers": total,
                 "guided_papers": total_guided,
                 "guidance_rate": guidance_rate,
-                "track_stats": enc_data['track_stats'],
             },
             "results": enc_data['results'],
         }
         evaluations.append(evaluation)
 
         print(f"\n[{len(evaluations)}/{len(encyclopedias_data)}] {os.path.basename(enc_data['path'])}: {total_guided}/{total} papers guided ({guidance_rate*100:.1f}%)")
-        for track in ["oral", "spotlight", "poster"]:
-            stats = enc_data['track_stats'][track]
-            if stats["total"] > 0:
-                pct = stats["guided"] / stats["total"] * 100
-                print(
-                    f"    {track.capitalize():10s}: {stats['guided']}/{stats['total']} guided ({pct:.1f}%)"
-                )
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     if len(evaluations) == 1:
         output_data = {
+            "judge_model": active_model_name,
             "encyclopedia": evaluations[0]["encyclopedia"],
             "path": evaluations[0]["path"],
+            "encyclopedia_sha256": evaluations[0]["encyclopedia_sha256"],
+            "judgments_jsonl": judgment_log_path,
             "metrics": evaluations[0]["metrics"],
             "results": evaluations[0]["results"],
         }
     else:
-        output_data = {"evaluations": evaluations}
+        output_data = {
+            "judge_model": active_model_name,
+            "judgments_jsonl": judgment_log_path,
+            "evaluations": evaluations,
+        }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
@@ -1204,11 +2246,7 @@ def main():
         for idx, eval_data in enumerate(evaluations, 1):
             metrics = eval_data["metrics"]
             overall_rate = metrics["guidance_rate"] * 100
-            track_stats = metrics["track_stats"]
-            oral_pct = track_stats["oral"]["guided"] / track_stats["oral"]["total"] * 100 if track_stats["oral"]["total"] > 0 else 0
-            spotlight_pct = track_stats["spotlight"]["guided"] / track_stats["spotlight"]["total"] * 100 if track_stats["spotlight"]["total"] > 0 else 0
-            poster_pct = track_stats["poster"]["guided"] / track_stats["poster"]["total"] * 100 if track_stats["poster"]["total"] > 0 else 0
-            summary_parts.append(f"file {idx}: all:{overall_rate:.1f}% oral:{oral_pct:.1f}% spotlight:{spotlight_pct:.1f}% poster:{poster_pct:.1f}%")
+            summary_parts.append(f"file {idx}: all:{overall_rate:.1f}%")
         print(" ".join(summary_parts))
         print(f"{'='*80}")
 
