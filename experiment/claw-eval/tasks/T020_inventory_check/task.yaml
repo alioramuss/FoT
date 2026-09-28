@@ -13,6 +13,8 @@ services:
     health_check_method: POST
     ready_timeout: 10
     reset_endpoint: http://localhost:9108/inventory/reset
+    env:
+      INVENTORY_FIXTURES: tasks/T020_inventory_check/fixtures/inventory/products.json
 
 prompt:
   text: |

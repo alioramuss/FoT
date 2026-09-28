@@ -1,4 +1,4 @@
-"""T26en_su7_price_from_image grader — English variant."""
+"""M100_su7_price_from_imageen_su7_price_from_image grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

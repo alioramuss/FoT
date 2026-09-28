@@ -1,4 +1,4 @@
-"""T43_micron_capex_analysis grader — judge + anchor scoring."""
+"""T069_micron_capex_analysis grader — judge + anchor scoring."""
 
 from __future__ import annotations
 

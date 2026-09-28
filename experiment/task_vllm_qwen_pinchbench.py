@@ -920,13 +920,8 @@ class VLLMQwenPinchBenchPipeline:
                 use_api=self.use_api,
                 api_key=self.api_key,
                 api_provider=self.api_provider,
+                api_model=self.api_model,
             )
-            if self.use_api and self.api_provider == "gemini" and self.api_model:
-                from utils import setup_gemini
-                self._client.gemini_model = setup_gemini(
-                    api_key=self.api_key,
-                    model_name=self.api_model,
-                )
         return self._client
 
     def _call_for_extraction(self, prompt: str, max_new_tokens: int) -> Tuple[str, Dict]:
@@ -1413,6 +1408,7 @@ class VLLMQwenPinchBenchPipeline:
             use_api=self.use_api,
             api_key=self.api_key,
             api_provider=self.api_provider,
+            api_model=self.api_model,
             input_dirs=[self.output_dir],
         )
 

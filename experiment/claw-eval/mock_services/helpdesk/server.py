@@ -51,6 +51,10 @@ def _log_call(endpoint: str, request_body: dict[str, Any], response_body: Any) -
 
 class ListTicketsRequest(BaseModel):
     status: str = "open"
+    priority: str | None = None
+    category: str | None = None
+    date_from: str | None = None
+    date_to: str | None = None
 
 
 class GetTicketRequest(BaseModel):
@@ -62,6 +66,7 @@ class UpdateTicketRequest(BaseModel):
     priority: str | None = None
     tags: list[str] | None = None
     category: str | None = None
+    assigned_to: str | None = None
 
 
 class CloseTicketRequest(BaseModel):
@@ -76,6 +81,14 @@ def list_tickets(req: ListTicketsRequest | None = None) -> dict[str, Any]:
     results = []
     for t in _tickets:
         if req.status == "all" or t["status"] == req.status:
+            if req.priority and t.get("priority") != req.priority:
+                continue
+            if req.category and t.get("category") != req.category:
+                continue
+            if req.date_from and t.get("created_at", "") < req.date_from:
+                continue
+            if req.date_to and t.get("created_at", "") > req.date_to:
+                continue
             results.append({
                 "ticket_id": t["ticket_id"],
                 "title": t["title"],
@@ -112,6 +125,8 @@ def update_ticket(req: UpdateTicketRequest) -> dict[str, Any]:
                 t["tags"] = req.tags
             if req.category is not None:
                 t["category"] = req.category
+            if req.assigned_to is not None:
+                t["assigned_to"] = req.assigned_to
             updated = copy.deepcopy(t)
             _updated_tickets.append(updated)
             resp = {"status": "updated", "ticket": updated}

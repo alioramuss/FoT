@@ -1,4 +1,4 @@
-"""T18en_vendor_procurement grader — English variant."""
+"""T036_vendor_procurementen_vendor_procurement grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

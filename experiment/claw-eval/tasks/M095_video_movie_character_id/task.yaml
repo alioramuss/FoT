@@ -24,7 +24,9 @@ services: []
 sandbox_files:
   - fixtures/video.mp4
 
-sandbox_grader_files:
+sandbox_grader_files: []
+
+local_grader_files:
   - fixtures/xialuo.png
   - fixtures/madongmei.png
   - fixtures/qiuya.png

@@ -1,4 +1,4 @@
-"""T16_escalation_budget_triage grader — cross-service escalation with budget threshold."""
+"""T031zh_escalation_budget_triage grader — cross-service escalation with budget threshold."""
 
 from __future__ import annotations
 
@@ -46,6 +46,16 @@ class EscalationBudgetTriageGrader(AbstractGrader):
     ALL_CUSTOMER_IDS = {"CUS-001", "CUS-002", "CUS-003", "CUS-004", "CUS-005", "CUS-008"}
 
     TICKET_IDS = {"TK-1601", "TK-1602", "TK-1603", "TK-1604", "TK-1605"}
+
+    # Labels for email formatting (overrideable by EN variant)
+    _SENT_LABEL = "已发送"
+    _DRAFT_LABEL = "草稿"
+    _SENT_HEADER = "已发送邮件"
+    _DRAFT_HEADER = "草稿邮件"
+    _NO_EMAILS_FMT = "没有{label}邮件。"
+    _EMAIL_TO_LABEL = "收件人(to)"
+    _EMAIL_SUBJECT_LABEL = "主题(subject)"
+    _EMAIL_BODY_LABEL = "正文(body)"
 
     # Markers for identifying customers in email text
     OVER_THRESHOLD_MARKERS = {
@@ -157,18 +167,17 @@ VIP客户为：CUS-003 华信科技、CUS-004 博通信息。
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _format_emails_for_judge(emails: list[dict], label: str) -> str:
+    def _format_emails_for_judge(self, emails: list[dict], label: str) -> str:
         """Format email audit data as readable text for judge context."""
         if not emails:
-            return f"没有{label}邮件。"
+            return self._NO_EMAILS_FMT.format(label=label)
         lines = []
         for i, mail in enumerate(emails, 1):
             lines.append(
                 f"[{label} #{i}]\n"
-                f"  收件人(to): {mail.get('to', 'N/A')}\n"
-                f"  主题(subject): {mail.get('subject', 'N/A')}\n"
-                f"  正文(body): {mail.get('body', 'N/A')}"
+                f"  {self._EMAIL_TO_LABEL}: {mail.get('to', 'N/A')}\n"
+                f"  {self._EMAIL_SUBJECT_LABEL}: {mail.get('subject', 'N/A')}\n"
+                f"  {self._EMAIL_BODY_LABEL}: {mail.get('body', 'N/A')}"
             )
         return "\n".join(lines)
 
@@ -207,10 +216,10 @@ VIP客户为：CUS-003 华信科技、CUS-004 博通信息。
         sent = self.get_service_actions(audit_data, "gmail", "sent")
         drafts = self.get_service_actions(audit_data, "gmail", "drafts")
 
-        sent_summary = self._format_emails_for_judge(sent, "已发送")
-        drafts_summary = self._format_emails_for_judge(drafts, "草稿")
+        sent_summary = self._format_emails_for_judge(sent, self._SENT_LABEL)
+        drafts_summary = self._format_emails_for_judge(drafts, self._DRAFT_LABEL)
         email_actions = (
-            f"## 已发送邮件\n{sent_summary}\n\n## 草稿邮件\n{drafts_summary}"
+            f"## {self._SENT_HEADER}\n{sent_summary}\n\n## {self._DRAFT_HEADER}\n{drafts_summary}"
         )
 
         # =============================================================

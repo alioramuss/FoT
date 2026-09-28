@@ -59,8 +59,10 @@ class GetTransactionRequest(BaseModel):
 
 class SubmitReportRequest(BaseModel):
     title: str
-    transactions: list[str]
-    total_amount: float
+    transactions: list[str] = Field(default_factory=list)
+    total_amount: float = 0.0
+    content: str | None = None
+    report_type: str | None = None
 
 
 @app.post("/finance/transactions")
@@ -97,6 +99,8 @@ def submit_report(req: SubmitReportRequest) -> dict[str, Any]:
         "title": req.title,
         "transactions": req.transactions,
         "total_amount": req.total_amount,
+        "content": req.content,
+        "report_type": req.report_type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     _submitted_reports.append(report)

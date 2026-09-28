@@ -1,4 +1,4 @@
-"""T14en_api_config_audit grader — English variant."""
+"""T028_api_config_auditen_api_config_audit grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

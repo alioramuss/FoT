@@ -1,4 +1,4 @@
-"""T02_calendar_scheduling grader — calendar conflict resolution and event creation."""
+"""T003zh_calendar_scheduling grader — calendar conflict resolution and event creation."""
 
 from __future__ import annotations
 

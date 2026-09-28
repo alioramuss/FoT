@@ -31,7 +31,9 @@ services: []
 sandbox_files:
   - fixtures/video.mp4
 
-sandbox_grader_files:
+sandbox_grader_files: []
+
+local_grader_files:
   - fixtures/gt_1.png
   - fixtures/gt_2.png
   - fixtures/gt_3.png

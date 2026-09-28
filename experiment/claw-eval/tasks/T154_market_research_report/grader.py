@@ -10,6 +10,18 @@ _Base = load_peer_grader("T153zh_market_research_report")
 class MarketResearchReportGraderEN(_Base):
     """English variant — overrides Chinese rubric strings only."""
 
+    KEY_ENTITIES = [
+        # Industry trends
+        "AI", "manufacturing", "healthcare", "education",
+        # Key data points
+        "120%", "35%", "renewal rate",
+        # CRM customers
+        "Huarui", "Dingsheng", "Renhe",
+        # Management contacts
+        "CEO Zhang", "CTO Li", "CMO Wang", "VP Zhao",
+    ]
+    _TOOL_SUMMARY_LABEL = "Tool Call Summary"
+
     _BREADTH_RUBRIC = """\
 Evaluate the breadth and completeness of the assistant's information gathering (0.0-1.0).
 

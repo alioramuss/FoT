@@ -1,4 +1,4 @@
-"""Deterministic grader for T39_phone_model_comparison."""
+"""Deterministic grader for T056zh_phone_model_comparison."""
 
 from claw_eval.graders.base import AbstractGrader
 from claw_eval.graders.image_qa_oracle import ImageQAOracleMixin

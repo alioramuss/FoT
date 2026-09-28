@@ -1,4 +1,4 @@
-"""T50_officeqa_defense_spending grader — U.S. national defense expenditures 1940."""
+"""T076_officeqa_defense_spending grader — U.S. national defense expenditures 1940."""
 
 from __future__ import annotations
 

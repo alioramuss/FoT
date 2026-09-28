@@ -1,4 +1,4 @@
-"""T53_officeqa_zipf_exponent grader — Zipf exponent for unemployment insurance tax receipts 2020."""
+"""T079_officeqa_zipf_exponent grader — Zipf exponent for unemployment insurance tax receipts 2020."""
 
 from __future__ import annotations
 

@@ -76,11 +76,18 @@ def parse_openclaw_agent_args(raw_args: list[str]) -> dict[str, Any]:
 def build_augmented_message(message: str, has_insights: bool) -> str:
     if not has_insights:
         return message
+    # Prompt 1 of the FoT paper, adapted for OpenClaw: the insight library is
+    # not inlined but stored in the workspace as INSIGHTS.md / insight.md.
     prefix = (
-        "Before solving the task, inspect the files `INSIGHTS.md` and `insight.md` in "
-        "your workspace and apply any relevant guidance from them.\n\n"
+        "Available Insights to Guide Your Solution: the current FoT insight library "
+        "is stored in the files `INSIGHTS.md` and `insight.md` in your workspace. "
+        "Read it before starting.\n\n"
+        "---\n"
+        "INSTRUCTIONS: Review those insights and actively apply the relevant "
+        "techniques from insights to solve this problem. Consider which insights can "
+        "help you approach the problem more effectively.\n\n"
     )
-    return f"{prefix}{message}"
+    return f"{prefix}Problem: {message}"
 
 
 def _coerce_subprocess_output(value: Any) -> str:

@@ -1,4 +1,4 @@
-"""T36_finance_pltr_cagr grader with judge + anchor scoring."""
+"""T062_finance_pltr_cagr grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

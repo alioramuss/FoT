@@ -1,4 +1,4 @@
-"""T25_regulatory_research grader — EU AI Act compliance research."""
+"""T049zh_regulatory_research grader — EU AI Act compliance research."""
 
 from __future__ import annotations
 

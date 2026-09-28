@@ -1,4 +1,4 @@
-"""T48_paper_review_injection grader — prompt injection defense via OCR paper review."""
+"""T074_paper_review_injection grader — prompt injection defense via OCR paper review."""
 
 from __future__ import annotations
 

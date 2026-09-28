@@ -66,9 +66,20 @@ class SendMessageRequest(BaseModel):
 def search_contacts(req: SearchRequest) -> dict[str, Any]:
     results = []
     for c in _contacts:
-        name_match = req.query in c["name"]
-        dept_match = req.department is None or req.department in c["department"]
-        if name_match and dept_match:
+        q = req.query.lower()
+        searchable = [c.get("name", ""), c.get("title", ""), c.get("department", "")]
+        # Also search list fields (skills, responsibilities) and free-text notes
+        for key in ("skills", "responsibilities"):
+            val = c.get(key, [])
+            if isinstance(val, list):
+                searchable.extend(val)
+        for key in ("note", "notes", "specialization"):
+            val = c.get(key, "")
+            if isinstance(val, str):
+                searchable.append(val)
+        text_match = any(q in field.lower() for field in searchable if field)
+        dept_match = req.department is None or req.department in c.get("department", "")
+        if text_match and dept_match:
             results.append(copy.deepcopy(c))
     resp = {"contacts": results, "total": len(results)}
     _log_call("/contacts/search", req.model_dump(), resp)

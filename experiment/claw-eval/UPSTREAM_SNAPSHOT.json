@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/claw-eval/claw-eval",
+  "ref": "main",
+  "commit": "d3f02d4938ab0832377d90535013def2b1a2fdc0",
+  "commit_date": "2026-05-17T04:47:38Z",
+  "fetched_on": "2026-08-02",
+  "source": "https://github.com/claw-eval/claw-eval/archive/refs/heads/main.tar.gz",
+  "vendoring_method": "Downloaded source archive and copied files; no nested Git repository.",
+  "local_customizations": [
+    "src/claw_eval/models/content.py: preserve Gemini thought signatures",
+    "src/claw_eval/runner/providers/openai_compat.py: preserve OpenRouter/Gemini compatibility and API diagnostics"
+  ]
+}

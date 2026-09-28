@@ -29,9 +29,10 @@ class ServiceManager:
     * ``reset_all()``: POST to each service's reset endpoint between trials.
     """
 
-    def __init__(self, services: list[ServiceDef], cwd: Path | None = None) -> None:
+    def __init__(self, services: list[ServiceDef], cwd: Path | None = None, mock_today: str | None = None) -> None:
         self._services = services
         self._cwd = cwd or Path.cwd()
+        self._mock_today = mock_today
         # Only processes we spawned ourselves — external ones are left alone.
         self._spawned: list[tuple[ServiceDef, subprocess.Popen]] = []  # type: ignore[type-arg]
 
@@ -110,6 +111,9 @@ class ServiceManager:
         ):
             base_env.pop(proxy_key, None)
         env = {**base_env, **(svc.env or {})}
+        # Inject MOCK_TODAY if the task defines it
+        if self._mock_today:
+            env["MOCK_TODAY"] = self._mock_today
         proc = subprocess.Popen(
             cmd,
             cwd=self._cwd,

@@ -1,4 +1,4 @@
-"""T41_synopsys_china_revenue grader — judge + anchor scoring."""
+"""T067zh_synopsys_china_revenue grader — judge + anchor scoring."""
 
 from __future__ import annotations
 

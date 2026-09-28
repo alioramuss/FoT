@@ -1,4 +1,4 @@
-"""T39_finance_x_inv_turnover grader with judge + anchor scoring."""
+"""T065_finance_x_inv_turnover grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

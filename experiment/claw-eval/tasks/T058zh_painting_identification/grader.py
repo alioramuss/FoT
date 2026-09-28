@@ -1,4 +1,4 @@
-"""Deterministic grader for T38_painting_identification."""
+"""Deterministic grader for T058zh_painting_identification."""
 
 from claw_eval.graders.base import AbstractGrader
 from claw_eval.graders.image_qa_oracle import ImageQAOracleMixin

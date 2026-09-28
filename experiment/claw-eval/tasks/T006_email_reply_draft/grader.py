@@ -1,4 +1,4 @@
-"""T03en_email_reply_draft grader — English variant."""
+"""T006_email_reply_draften_email_reply_draft grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 
@@ -7,6 +7,8 @@ _Base = load_peer_grader("T005zh_email_reply_draft")
 
 class EmailReplyDraftGraderEN(_Base):
     """English variant — overrides language-specific class attributes and rubrics."""
+
+    BOSS_FALLBACK_KEYWORDS = ["竞品", "分析报告", "competitor", "analysis report", "competitive"]
 
     # ------------------------------------------------------------------ #
     # LLM Judge rubrics (English)

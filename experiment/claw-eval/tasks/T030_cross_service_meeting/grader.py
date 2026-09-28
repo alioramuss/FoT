@@ -1,4 +1,4 @@
-"""T15en_cross_service_meeting grader — English variant."""
+"""T030_cross_service_meetingen_cross_service_meeting grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

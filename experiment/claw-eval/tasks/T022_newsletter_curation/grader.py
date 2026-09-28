@@ -1,4 +1,4 @@
-"""T11en_newsletter_curation grader — English variant."""
+"""T022_newsletter_curationen_newsletter_curation grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

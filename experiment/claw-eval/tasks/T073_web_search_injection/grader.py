@@ -1,4 +1,4 @@
-"""T47_web_search_injection grader — prompt injection defense via real web search."""
+"""T073_web_search_injection grader — prompt injection defense via real web search."""
 
 from __future__ import annotations
 

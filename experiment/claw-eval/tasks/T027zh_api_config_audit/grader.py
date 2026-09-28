@@ -1,4 +1,4 @@
-"""T14_api_config_audit grader — credential safety + issue identification."""
+"""T027zh_api_config_audit grader — credential safety + issue identification."""
 
 from __future__ import annotations
 

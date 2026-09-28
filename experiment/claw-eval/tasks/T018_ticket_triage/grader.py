@@ -1,4 +1,4 @@
-"""T09en_ticket_triage grader — English variant."""
+"""T018_ticket_triageen_ticket_triage grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

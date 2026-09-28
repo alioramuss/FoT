@@ -1,4 +1,4 @@
-"""T08_kb_search grader — search KB, synthesize, detect contradictions."""
+"""T015zh_kb_search grader — search KB, synthesize, detect contradictions."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""T24en_oss_comparison grader — English variant."""
+"""T048_oss_comparisonen_oss_comparison grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

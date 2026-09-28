@@ -1,4 +1,4 @@
-"""T08en_kb_search grader — English variant."""
+"""T016_kb_searchen_kb_search grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

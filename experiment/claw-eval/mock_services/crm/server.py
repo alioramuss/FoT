@@ -76,7 +76,7 @@ def list_customers(req: ListCustomersRequest | None = None) -> dict[str, Any]:
         req = ListCustomersRequest()
     results = []
     for c in _customers:
-        if req.status and c["status"] != req.status:
+        if req.status and req.status != "all" and c["status"] != req.status:
             continue
         if req.tier and c["tier"] != req.tier:
             continue

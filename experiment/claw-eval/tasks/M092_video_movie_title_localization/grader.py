@@ -26,7 +26,7 @@ from claw_eval.models.trace import DimensionScores, MediaLoad, ToolDispatch, Tra
 
 ANSWER_FILE = "/workspace/answer.txt"
 IMAGE_FILE = "/workspace/title_frame.png"
-GT_IMAGE = "/workspace/fixtures/gt.png"
+GT_LOCAL_FILE = "fixtures/gt.png"
 
 CHINESE_TITLE_RUBRIC = """\
 You are evaluating whether the agent correctly identified the Chinese film title.
@@ -144,7 +144,7 @@ class Grader(AbstractGrader, MultimodalGraderMixin, VisualGraderMixin):
                 else ""
             )
 
-            gt_entry = snapshot.get(f"file:{GT_IMAGE}", {})
+            gt_entry = snapshot.get(f"local_file:{GT_LOCAL_FILE}", {})
             gt_b64 = (
                 gt_entry.get("content", "")
                 if gt_entry.get("encoding") == "base64"

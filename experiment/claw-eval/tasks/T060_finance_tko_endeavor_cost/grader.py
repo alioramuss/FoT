@@ -1,4 +1,4 @@
-"""T34_finance_tko_endeavor_cost grader with judge + anchor scoring."""
+"""T060_finance_tko_endeavor_cost grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

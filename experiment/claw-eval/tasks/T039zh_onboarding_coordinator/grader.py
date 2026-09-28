@@ -1,4 +1,4 @@
-"""T20_onboarding_coordinator grader — expert multi-service onboarding coordination."""
+"""T039zh_onboarding_coordinator grader — expert multi-service onboarding coordination."""
 
 from __future__ import annotations
 

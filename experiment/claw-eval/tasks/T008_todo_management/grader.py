@@ -1,4 +1,4 @@
-"""T04en_todo_management grader — English variant."""
+"""T008_todo_managementen_todo_management grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

@@ -8,6 +8,7 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..models.content import AudioBlock, ImageBlock, TextBlock, VideoBlock
 
@@ -217,7 +218,29 @@ def to_content_block(media: LoadedMedia) -> ImageBlock | AudioBlock | VideoBlock
     return VideoBlock(data=media.data_base64, mime_type=media.mime_type, source_path=media.source_path)
 
 
-def model_supports_modality(input_modalities: list[str], modality: str) -> bool:
-    if modality == "document":
-        return "text" in set(input_modalities)
-    return modality in set(input_modalities)
+def model_supports_modality(input_modalities: Any, modality: str) -> bool:
+    """Return whether a model accepts *modality*.
+
+    New callers pass ``ModelConfig.input_modalities`` directly.  Accepting a
+    ``ModelConfig`` as well keeps this boundary safe for older callers: Pydantic
+    models are iterable as ``(field, value)`` pairs, and feeding those pairs to
+    ``set()`` fails with ``TypeError: unhashable type: 'list'`` as soon as a
+    list-valued field is encountered.
+
+    Flattening list/tuple/set containers also tolerates configuration assembled
+    from CLI/YAML layers without ever attempting to hash the raw values.
+    """
+    configured = getattr(input_modalities, "input_modalities", input_modalities)
+
+    def _strings(value: Any):
+        if isinstance(value, str):
+            yield value.strip().lower()
+        elif isinstance(value, dict):
+            yield from _strings(value.get("input_modalities", []))
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                yield from _strings(item)
+
+    supported = set(_strings(configured))
+    requested = "text" if modality.lower() == "document" else modality.lower()
+    return requested in supported

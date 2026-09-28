@@ -4,13 +4,28 @@ Used by client.py, client_metacognitive.py, server.py, server_text.py,
 server_cod.py, server_claude_compact.py, etc.
 """
 
+import base64
+import io
 import os
-import re
 import json
-from typing import Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Optional, Tuple
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
+
+# API-only callers should not require the optional local Hugging Face stack.
+# Importing transformers can also raise an ImportError for an incompatible
+# huggingface-hub version, so defer that failure until load_hf_model() is used.
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    _TRANSFORMERS_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:
+    AutoModelForCausalLM = Any  # type: ignore[misc,assignment]
+    AutoTokenizer = Any  # type: ignore[misc,assignment]
+    _TRANSFORMERS_IMPORT_ERROR = exc
 
 try:
     from google import genai as genai_new
@@ -41,12 +56,182 @@ TRUNCATED_INPUT_CHARS_FALLBACK = (
     TRUNCATED_INPUT_TOKENS * _FALLBACK_CHARS_PER_TOKEN_ESTIMATE
 )
 
+# OpenRouter reports a 1,048,576-token context window for Gemini 2.5 Flash.
+# Reserve room for output, request metadata/schema, reasoning, and image
+# tokens. A one-character-per-token input bound is deliberately conservative:
+# it guarantees that long profiling prompts are reduced before the API call
+# even when the provider tokenizer is unavailable locally.
+OPENROUTER_CONTEXT_WINDOWS = {
+    "google/gemini-2.5-flash": 1_048_576,
+    "google/gemini-2.5-flash-lite": 1_048_576,
+}
+OPENROUTER_CONTEXT_SAFETY_TOKENS = 16_384
+
+
+class OpenRouterInFlightBudgetError(RuntimeError):
+    """OpenRouter refused admission because shared in-flight credit is full."""
+
+
+def sanitize_unicode_text(value: Any) -> str:
+    """Return UTF-8-safe text, replacing malformed UTF-16 surrogates.
+
+    Some PDF parsers preserve unpaired surrogate code points. Python strings
+    can hold them, but HTTP/JSON UTF-8 encoders cannot. Replacing only those
+    invalid code points keeps the rest of the extracted paper text unchanged.
+    """
+    text = value if isinstance(value, str) else str(value)
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _openrouter_retry_details(exc: Exception) -> Tuple[Optional[int], str, str, float]:
+    """Extract status, provider reason, limit_source, and Retry-After from an SDK error."""
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+
+    body = getattr(exc, "body", None)
+    error_body = body.get("error", body) if isinstance(body, dict) else {}
+    metadata = error_body.get("metadata", {}) if isinstance(error_body, dict) else {}
+    reason = str(metadata.get("reason", "")) if isinstance(metadata, dict) else ""
+    # "in_flight_budget_exhausted" (too many concurrent requests) reports its
+    # classification under "reason"; a genuinely low/exhausted account
+    # balance instead reports "limit_source": "openrouter_credits" with no
+    # "reason" key at all. Both are account-wide conditions where every
+    # subsequent request is doomed identically until something external
+    # changes (other jobs finish, or credits are added) — neither is a
+    # per-problem failure worth burning through the rest of a benchmark for.
+    limit_source = (
+        str(metadata.get("limit_source", "")) if isinstance(metadata, dict) else ""
+    )
+
+    retry_after: Any = None
+    if response is not None:
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after is None and isinstance(metadata, dict):
+        metadata_headers = metadata.get("headers", {})
+        if isinstance(metadata_headers, dict):
+            retry_after = metadata_headers.get("Retry-After") or metadata_headers.get(
+                "retry-after"
+            )
+    try:
+        retry_seconds = max(0.0, float(retry_after))
+    except (TypeError, ValueError):
+        retry_seconds = 0.0
+
+    # Older openai SDK releases do not consistently expose ``body`` or even a
+    # numeric status attribute. Preserve provider-specific classification from
+    # the exception text as a final compatibility fallback.
+    error_text = str(exc)
+    error_text_lower = error_text.lower()
+    if status is None and any(
+        marker in error_text_lower
+        for marker in ("error code: 402", "http 402", "'code': 402", '"code": 402')
+    ):
+        status = 402
+    if not reason and "in_flight_budget_exhausted" in error_text:
+        reason = "in_flight_budget_exhausted"
+    if not limit_source and (
+        "openrouter_credits" in error_text
+        or "requires more credits" in error_text_lower
+        or "can only afford" in error_text_lower
+    ):
+        limit_source = "openrouter_credits"
+    return status, reason, limit_source, retry_seconds
+
+
+def is_openrouter_budget_error(exc: Exception) -> bool:
+    """Return whether an exception is an account-wide OpenRouter 402."""
+    if isinstance(exc, OpenRouterInFlightBudgetError):
+        return True
+    status, reason, limit_source, _ = _openrouter_retry_details(exc)
+    return status == 402 and (
+        reason == "in_flight_budget_exhausted"
+        or limit_source == "openrouter_credits"
+    )
+
+
+def _truncate_prompt_preserving_ends(text: str, max_chars: int) -> Tuple[str, bool]:
+    """Conservatively fit text while retaining instructions at both ends."""
+    if len(text) <= max_chars:
+        return text, False
+    marker = (
+        "\n\n[... middle of oversized input truncated to fit the model context ...]\n\n"
+    )
+    usable = max(1, max_chars - len(marker))
+    head_chars = int(usable * 0.7)
+    tail_chars = usable - head_chars
+    return text[:head_chars] + marker + text[-tail_chars:], True
+
+DEFAULT_API_MODELS = {
+    "gemini": "gemini-2.5-flash-lite",
+    "openrouter": "google/gemini-2.5-flash-lite",
+}
+OPENROUTER_RETIRED_MODEL_REPLACEMENTS = {
+    "google/gemini-2.0-flash-001": "google/gemini-2.5-flash",
+}
+_WARNED_MODEL_REPLACEMENTS = set()
+
+
+def normalize_api_model(provider: str, model_name: Optional[str] = None) -> str:
+    """Return a provider-ready model name.
+
+    OpenRouter accepts slugs such as ``google/gemini-2.5-flash-lite``.  The
+    optional ``openrouter/`` prefix used by some agent harnesses is stripped
+    before sending the request to OpenRouter itself.
+    """
+    normalized_provider = (provider or "gemini").strip().lower()
+    if normalized_provider not in DEFAULT_API_MODELS:
+        raise ValueError(
+            f"Unsupported API provider {provider!r}; expected one of "
+            f"{sorted(DEFAULT_API_MODELS)}"
+        )
+    model = (model_name or DEFAULT_API_MODELS[normalized_provider]).strip()
+    if normalized_provider == "openrouter" and model.startswith("openrouter/"):
+        model = model[len("openrouter/") :]
+    if (
+        normalized_provider == "openrouter"
+        and model in OPENROUTER_RETIRED_MODEL_REPLACEMENTS
+    ):
+        replacement = OPENROUTER_RETIRED_MODEL_REPLACEMENTS[model]
+        if model not in _WARNED_MODEL_REPLACEMENTS:
+            print(
+                f"OpenRouter model {model} is retired/unavailable; "
+                f"using active replacement {replacement}."
+            )
+            _WARNED_MODEL_REPLACEMENTS.add(model)
+        model = replacement
+    if not model:
+        raise ValueError("API model name cannot be empty")
+    return model
+
+
+def resolve_api_key(provider: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Resolve the explicit or environment-provided key for an API provider."""
+    if api_key:
+        return api_key
+    normalized_provider = (provider or "gemini").strip().lower()
+    env_name = {
+        "gemini": "GEMINI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+    }.get(normalized_provider)
+    if env_name is None:
+        raise ValueError(f"Unsupported API provider {provider!r}")
+    return os.getenv(env_name)
+
 
 # ---------------------------------------------------------------------------
 # CUDA check
 # ---------------------------------------------------------------------------
 def check_cuda() -> bool:
     """Check if CUDA is available."""
+    if torch is None:
+        return False
     try:
         return torch.cuda.is_available()
     except ImportError:
@@ -186,7 +371,7 @@ def _resolve_hf_context_limit(model: AutoModelForCausalLM, tokenizer: AutoTokeni
 # ---------------------------------------------------------------------------
 def setup_gemini(
     api_key: Optional[str] = None,
-    model_name: str = "gemini-3-pro-preview",
+    model_name: str = "gemini-2.5-flash-lite",
 ) -> "_GeminiModel":
     """Initialize Gemini API and return a model wrapper.
 
@@ -272,7 +457,10 @@ def call_gemini(
                 )
 
         # Configure generation parameters
-        generation_config = {}
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
         if max_new_tokens:
             generation_config["max_output_tokens"] = max_new_tokens
 
@@ -357,6 +545,10 @@ def call_openrouter(
     prompt: str,
     system_prompt: Optional[str] = None,
     max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+    reasoning_enabled: Optional[bool] = None,
+    image: Optional[Any] = None,
 ) -> Tuple[str, Dict]:
     """Call OpenRouter API (OpenAI-compatible endpoint).
 
@@ -366,6 +558,11 @@ def call_openrouter(
         prompt: User prompt text.
         system_prompt: Optional system prompt.
         max_new_tokens: Max output tokens.
+        temperature: Optional sampling temperature.
+        response_format: Optional OpenAI-compatible JSON response constraint.
+        reasoning_enabled: Explicitly enable or disable provider reasoning.
+        image: Optional image for a multimodal request. Accepts a PIL-compatible
+            object with ``save()``, raw image bytes, or a ``data:image`` URI.
 
     Returns:
         Tuple of (generated_text, token_info_dict).
@@ -381,40 +578,247 @@ def call_openrouter(
             "OpenRouter API key is required. Set OPENROUTER_API_KEY env var or pass api_key."
         )
 
-    client = _OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
-
+    model_name = normalize_api_model("openrouter", model_name)
+    prompt = sanitize_unicode_text(prompt)
+    if system_prompt is not None:
+        system_prompt = sanitize_unicode_text(system_prompt)
+    context_window = OPENROUTER_CONTEXT_WINDOWS.get(model_name)
+    input_truncated = False
+    original_prompt_chars = len(prompt)
+    if context_window is not None:
+        reserved_output = int(max_new_tokens or 0)
+        prompt_char_budget = max(
+            1,
+            context_window
+            - reserved_output
+            - OPENROUTER_CONTEXT_SAFETY_TOKENS
+            - len(system_prompt or ""),
+        )
+        prompt, input_truncated = _truncate_prompt_preserving_ends(
+            prompt, prompt_char_budget
+        )
+        if input_truncated:
+            print(
+                "OpenRouter prompt exceeded the conservative context budget; "
+                f"truncated from {original_prompt_chars} to {len(prompt)} characters "
+                f"while reserving {reserved_output} output tokens."
+            )
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+    if image is None:
+        user_content: Any = prompt
+    else:
+        if isinstance(image, str):
+            if not image.startswith("data:image"):
+                raise ValueError(
+                    "OpenRouter image strings must be data:image URIs."
+                )
+            image_uri = image
+        elif isinstance(image, (bytes, bytearray)):
+            image_uri = (
+                "data:image/png;base64,"
+                + base64.b64encode(bytes(image)).decode("ascii")
+            )
+        elif hasattr(image, "save"):
+            with io.BytesIO() as image_buffer:
+                image.save(image_buffer, format="PNG")
+                image_uri = (
+                    "data:image/png;base64,"
+                    + base64.b64encode(image_buffer.getvalue()).decode("ascii")
+                )
+        else:
+            raise TypeError(
+                "OpenRouter image must be a PIL-compatible image, bytes, or data URI."
+            )
+        user_content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_uri}},
+        ]
+    messages.append({"role": "user", "content": user_content})
 
     kwargs = {}
     if max_new_tokens:
         kwargs["max_tokens"] = max_new_tokens
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    extra_body: Dict[str, Any] = {}
+    reasoning_max_tokens: Optional[int] = None
+    if reasoning_enabled is not None:
+        reasoning_config: Dict[str, Any] = {"enabled": reasoning_enabled}
+        if reasoning_enabled and max_new_tokens:
+            try:
+                configured_reasoning_tokens = max(
+                    1024,
+                    int(os.getenv("OPENROUTER_REASONING_MAX_TOKENS", "8192")),
+                )
+            except ValueError:
+                configured_reasoning_tokens = 8192
+            # OpenRouter requires the overall completion maximum to be larger
+            # than the reasoning budget so a final answer can still be emitted.
+            reasoning_max_tokens = min(
+                configured_reasoning_tokens,
+                max(0, int(max_new_tokens) - 1024),
+            )
+            if reasoning_max_tokens >= 1024:
+                # max_tokens itself enables reasoning. Do not also send the
+                # default-config switch; use the unambiguous budgeted form from
+                # OpenRouter's unified reasoning API.
+                reasoning_config = {"max_tokens": reasoning_max_tokens}
+        extra_body["reasoning"] = reasoning_config
+    if context_window is not None:
+        # Final provider-side guard using OpenRouter's exact tokenizer. This is
+        # normally a no-op after the conservative local bound, but protects
+        # against image/schema/tokenizer overhead that character counting
+        # cannot measure.
+        extra_body["transforms"] = ["middle-out"]
+    if extra_body:
+        kwargs["extra_body"] = extra_body
 
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            **kwargs,
+        max_attempts = max(1, int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "5")))
+    except ValueError:
+        max_attempts = 5
+    response = None
+    for attempt in range(max_attempts):
+        client = _OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
         )
-    except Exception as e:
-        raise RuntimeError(f"Error calling OpenRouter API: {e}")
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                **kwargs,
+            )
+            break
+        except Exception as exc:
+            status, reason, limit_source, retry_after = _openrouter_retry_details(exc)
+            in_flight_402 = (
+                status == 402 and reason == "in_flight_budget_exhausted"
+            )
+            credits_402 = status == 402 and limit_source == "openrouter_credits"
+            if in_flight_402 or credits_402:
+                # Both are account-wide admission failures, not a bad request
+                # for this one problem: every subsequent call will fail
+                # identically until something external changes. Raise a
+                # dedicated type so callers (task_benchmark_domain.py,
+                # pinchbench/claweval eval loops) can stop the whole batch
+                # instead of burning through every remaining item with the
+                # same doomed request.
+                detail = (
+                    "the account's shared in-flight budget is exhausted"
+                    if in_flight_402
+                    else "the account does not have enough remaining credits "
+                    "for the requested max_tokens"
+                )
+                raise OpenRouterInFlightBudgetError(
+                    f"OpenRouter rejected the request because {detail}. No "
+                    "automatic retry was made; completed checkpoints are "
+                    "preserved. Wait for other jobs to finish, reduce "
+                    "concurrent API requests, lower max_tokens, or add "
+                    "credits at https://openrouter.ai/settings/credits."
+                ) from exc
+            retryable = status == 429 or (
+                status is not None and status >= 500
+            )
+            if not retryable or attempt + 1 >= max_attempts:
+                raise RuntimeError(f"Error calling OpenRouter API: {exc}") from exc
+            if retry_after <= 0:
+                retry_after = min(60.0, 2.0**attempt)
+            delay = retry_after
+            print(
+                f"OpenRouter HTTP {status} ({reason or 'transient'}); "
+                f"retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{max_attempts})",
+                flush=True,
+            )
+            time.sleep(delay)
+        finally:
+            # A fresh SDK client is created for each independent API call.
+            # Closing it prevents long parallel runs from leaking sockets.
+            try:
+                client.close()
+            except Exception:
+                pass
+    if response is None:
+        raise RuntimeError("OpenRouter API returned no response")
 
     choice = response.choices[0]
-    text = choice.message.content or ""
+    message = choice.message
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\n".join(
+            str(
+                block.get("text", "")
+                if isinstance(block, dict)
+                else getattr(block, "text", "")
+            )
+            for block in content
+            if (
+                isinstance(block, dict) and block.get("text")
+            ) or getattr(block, "text", None)
+        )
+    else:
+        text = ""
+
+    message_data = message.model_dump() if hasattr(message, "model_dump") else {}
+    reasoning_parts = []
+    for key in ("reasoning", "reasoning_content"):
+        value = message_data.get(key, getattr(message, key, None))
+        if isinstance(value, str) and value.strip():
+            reasoning_parts.append(value.strip())
+    details = message_data.get("reasoning_details") or []
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            value = detail.get("text") or detail.get("summary")
+            if isinstance(value, str) and value.strip():
+                reasoning_parts.append(value.strip())
+    reasoning_text = "\n".join(reasoning_parts).strip()
+    used_reasoning_fallback = False
+    if not text.strip() and reasoning_text:
+        # Reasoning endpoints may exhaust their generation budget before
+        # emitting final content. Reflection is itself reasoning text, and a
+        # complete reasoning-only extraction response is still preferable to
+        # silently turning a non-empty provider response into an empty string.
+        text = reasoning_text
+        used_reasoning_fallback = True
     finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
 
     usage = getattr(response, "usage", None)
+    completion_details = (
+        getattr(usage, "completion_tokens_details", None) if usage else None
+    )
+    reasoning_tokens = (
+        getattr(completion_details, "reasoning_tokens", 0)
+        if completion_details is not None
+        else getattr(usage, "reasoning_tokens", 0) if usage else 0
+    )
     token_info = {
         "backend": "openrouter",
         "model": model_name,
         "finish_reason": finish_reason,
         "input_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
         "output_tokens": getattr(usage, "completion_tokens", len(text) // 4) if usage else len(text) // 4,
+        "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+        "cost_usd": getattr(usage, "cost", 0.0) if usage else 0.0,
+        "request_count": 1,
+        "reasoning_chars": len(reasoning_text),
+        "reasoning_tokens": int(reasoning_tokens or 0),
+        "used_reasoning_fallback": used_reasoning_fallback,
+        "max_new_tokens": max_new_tokens,
+        "reasoning_enabled": reasoning_enabled,
+        "reasoning_max_tokens": reasoning_max_tokens,
+        "multimodal_image": image is not None,
+        "input_truncated": input_truncated,
+        "original_prompt_chars": original_prompt_chars,
+        "sent_prompt_chars": len(prompt),
     }
     return text, token_info
 
@@ -492,6 +896,14 @@ def call_gemini_thinking(
         )
     except Exception as e:
         raise RuntimeError(f"Error calling Gemini (thinking) API: {e}")
+    finally:
+        # A fresh SDK client is created for each independent API call (see
+        # call_openrouter's client lifecycle). Closing it prevents long
+        # parallel runs from leaking sockets/file descriptors.
+        try:
+            client.close()
+        except Exception:
+            pass
 
     text = getattr(response, "text", None)
     if not text:
@@ -548,6 +960,17 @@ def load_hf_model(
     Returns:
         Tuple of (model, tokenizer).
     """
+    if _TRANSFORMERS_IMPORT_ERROR is not None or torch is None:
+        detail = (
+            str(_TRANSFORMERS_IMPORT_ERROR)
+            if _TRANSFORMERS_IMPORT_ERROR is not None
+            else "PyTorch is not installed"
+        )
+        raise ImportError(
+            "Local Hugging Face model loading is unavailable. Install compatible "
+            f"torch, transformers, and huggingface-hub packages. Original error: {detail}"
+        )
+
     print(f"Loading model: {model_name}")
     print(f"Device: {device}")
 

@@ -1,4 +1,4 @@
-"""T20en_onboarding_coordinator grader — English variant.
+"""T040_onboarding_coordinatoren_onboarding_coordinator grader — English variant.
 
 Overrides all language-specific scoring methods from the ZH base grader
 to match English names, departments, and keywords used in the EN fixtures.

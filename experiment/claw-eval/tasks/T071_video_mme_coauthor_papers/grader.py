@@ -1,4 +1,4 @@
-"""T45_video_mme_coauthor_papers grader — judge + anchor scoring."""
+"""T071_video_mme_coauthor_papers grader — judge + anchor scoring."""
 
 from __future__ import annotations
 

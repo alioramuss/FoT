@@ -37,12 +37,18 @@ def _load_fixtures() -> None:
     Fixture dates are absolute and become stale over time.  We shift all
     events forward so the earliest event is ~1 day from now, keeping the
     relative spacing intact.
+
+    When MOCK_TODAY is set, fixtures are already at correct dates — don't shift.
     """
     global _events
     with open(FIXTURES_PATH) as f:
         _events = json.load(f)
 
     if not _events:
+        return
+
+    # When MOCK_TODAY is set, fixtures are already at correct dates — don't shift
+    if os.environ.get("MOCK_TODAY"):
         return
 
     # Find the earliest start_time

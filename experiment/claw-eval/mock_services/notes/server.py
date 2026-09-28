@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import copy
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,10 @@ def _log_call(endpoint: str, request_body: dict[str, Any], response_body: Any) -
 
 class ListRequest(BaseModel):
     max_results: int = 10
+    tag: str | None = None
+    days_back: int | None = None
+    date_from: str | None = None
+    date_to: str | None = None
 
 
 class GetRequest(BaseModel):
@@ -65,14 +69,39 @@ class ShareRequest(BaseModel):
 def list_notes(req: ListRequest | None = None) -> dict[str, Any]:
     if req is None:
         req = ListRequest()
+
+    # Compute days_back cutoff if needed
+    cutoff_date: str | None = None
+    if req.days_back is not None:
+        mock_today = os.environ.get("MOCK_TODAY")
+        if mock_today:
+            today = datetime.strptime(mock_today, "%Y-%m-%d")
+        else:
+            today = datetime.now(timezone.utc)
+        cutoff = today - timedelta(days=req.days_back)
+        cutoff_date = cutoff.strftime("%Y-%m-%d")
+
+    filtered = []
+    for note in _notes:
+        if req.tag and req.tag not in note.get("tags", []):
+            continue
+        created = note.get("created_at", "")
+        if req.date_from and created < req.date_from:
+            continue
+        if req.date_to and created > req.date_to:
+            continue
+        if cutoff_date and created < cutoff_date:
+            continue
+        filtered.append(note)
+
     results = []
-    for note in _notes[:req.max_results]:
+    for note in filtered[:req.max_results]:
         results.append({
             "note_id": note["note_id"],
             "title": note["title"],
             "created_at": note["created_at"],
-            "participants": note["participants"],
-            "duration_minutes": note["duration_minutes"],
+            "participants": note.get("participants", []),
+            "duration_minutes": note.get("duration_minutes", 0),
         })
     resp = {"notes": results, "total": len(results)}
     _log_call("/notes/list", req.model_dump(), resp)

@@ -1,4 +1,4 @@
-"""T22en_service_outage_research grader — English variant."""
+"""T044_service_outage_researchen_service_outage_research grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

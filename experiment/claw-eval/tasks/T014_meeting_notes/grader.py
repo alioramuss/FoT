@@ -1,4 +1,4 @@
-"""T07en_meeting_notes grader — English variant."""
+"""T014_meeting_notesen_meeting_notes grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 
@@ -7,6 +7,9 @@ _Base = load_peer_grader("T013zh_meeting_notes")
 
 class MeetingNotesGraderEN(_Base):
     """English variant — overrides language-specific class attributes and rubrics."""
+
+    VALID_SHARE_RECIPIENTS = {"Manager Zhang", "Li Ming", "Wang Fang", "Zhao Qiang"}
+    REQUIRED_PARTICIPANTS = {"Manager Zhang", "Li Ming", "Wang Fang", "Zhao Qiang"}
 
     ACTION_ITEMS = [
         {"assignee": "Zhao Qiang", "task": "bug", "deadline": "Friday"},

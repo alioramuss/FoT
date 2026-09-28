@@ -1,4 +1,4 @@
-"""T23en_cve_research grader — English variant."""
+"""T046_cve_researchen_cve_research grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

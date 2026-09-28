@@ -1,4 +1,4 @@
-"""T37_finance_fnd_sssg grader with judge + anchor scoring."""
+"""T063_finance_fnd_sssg grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

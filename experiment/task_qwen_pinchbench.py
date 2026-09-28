@@ -835,10 +835,8 @@ class QwenPinchBenchPipeline:
         if self._client is None:
             self._client = ChainOfThoughtReader(
                 use_api=self.use_api, api_key=self.api_key, api_provider=self.api_provider,
+                api_model=self.api_model,
             )
-            if self.use_api and self.api_provider == "gemini" and self.api_model:
-                from utils import setup_gemini
-                self._client.gemini_model = setup_gemini(api_key=self.api_key, model_name=self.api_model)
         return self._client
 
     def _call_for_extraction(self, prompt: str, max_new_tokens: int) -> Tuple[str, Dict]:
@@ -853,7 +851,7 @@ class QwenPinchBenchPipeline:
         client = self._ensure_client()
 
         print("  Step 2: Reflecting...")
-        reflection, _ = self._call_for_extraction(
+        reflection, reflection_token_info = self._call_for_extraction(
             client._get_reflection_prompt(task_prompt, agent_response), max_new_tokens=4096
         )
 
@@ -895,7 +893,20 @@ class QwenPinchBenchPipeline:
             print(f"  Warning: insight parse error: {exc}")
 
         print(f"  Extracted {len(insights)} insights")
-        return {"insight_book": insights, "output_tokens": token_info.get("output_tokens", 0)}
+        reflection_tokens = int(reflection_token_info.get("output_tokens", 0) or 0) + int(
+            reflection_token_info.get("thinking_tokens", 0) or 0
+        )
+        trace_extraction_tokens = int(token_info.get("output_tokens", 0) or 0) + int(
+            token_info.get("thinking_tokens", 0) or 0
+        )
+        return {
+            "insight_book": insights,
+            "output_tokens": reflection_tokens + trace_extraction_tokens,
+            "output_token_breakdown": {
+                "reflection": reflection_tokens,
+                "trace_extraction": trace_extraction_tokens,
+            },
+        }
 
     def _grade(self, task: Task, exec_result: Dict[str, Any]):
         return grade_task(
@@ -922,6 +933,16 @@ class QwenPinchBenchPipeline:
             for name, count in (t.get("tools", {}).get("name_counts", {}) or {}).items():
                 tool_counts[name] = tool_counts.get(name, 0) + int(count)
 
+        agent_output_tokens = sum(
+            int((t.get("output_tokens") or {}).get("agent", 0) or 0)
+            for t in task_metrics
+        )
+        extraction_output_tokens = sum(
+            int((t.get("output_tokens") or {}).get("extraction", 0) or 0)
+            for t in task_metrics
+        )
+        task_output_tokens = agent_output_tokens + extraction_output_tokens
+
         payload = {
             "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "model": self.model_name,
@@ -934,8 +955,14 @@ class QwenPinchBenchPipeline:
                 "tool_names": sorted(tool_counts.keys()),
                 "tool_name_counts": dict(sorted(tool_counts.items())),
                 "total_tool_calls": sum(int(t.get("tools", {}).get("total_calls", 0) or 0) for t in task_metrics),
-                "output_tokens_agent_total": sum(int((t.get("output_tokens") or {}).get("agent", 0) or 0) for t in task_metrics),
-                "output_tokens_extraction_total": sum(int((t.get("output_tokens") or {}).get("extraction", 0) or 0) for t in task_metrics),
+                "output_tokens_agent_total": agent_output_tokens,
+                "output_tokens_extraction_total": extraction_output_tokens,
+                "output_tokens_total": task_output_tokens,
+                "output_tokens_iteration_total": (
+                    task_output_tokens + int(lib_tokens)
+                    if lib_tokens is not None
+                    else None
+                ),
                 "execution_time_total_seconds": sum(float(t.get("execution_time_seconds", 0.0) or 0.0) for t in task_metrics),
                 "library_output_tokens": int(lib_tokens) if lib_tokens is not None else None,
             },
@@ -1057,7 +1084,14 @@ class QwenPinchBenchPipeline:
 
             insight_book = extraction.get("insight_book", {}) or {}
             extract_tokens = int(extraction.get("output_tokens", 0) or 0)
-            task_metric["output_tokens"] = {"agent": agent_tokens, "extraction": extract_tokens, "total": agent_tokens + extract_tokens}
+            extraction_breakdown = extraction.get("output_token_breakdown", {}) or {}
+            task_metric["output_tokens"] = {
+                "agent": agent_tokens,
+                "extraction": extract_tokens,
+                "reflection": int(extraction_breakdown.get("reflection", 0) or 0),
+                "trace_extraction": int(extraction_breakdown.get("trace_extraction", 0) or 0),
+                "total": agent_tokens + extract_tokens,
+            }
             task_metric["insights_extracted"] = len(insight_book)
 
             task_counter += 1
@@ -1066,7 +1100,7 @@ class QwenPinchBenchPipeline:
                 json.dump({
                     "task_id": task.task_id, "task_name": task.name,
                     "task_prompt": task.prompt, "execution_status": status,
-                    "output_tokens": extract_tokens,
+                    "output_tokens": task_metric["output_tokens"],
                     "grade": {"score": grade.score if grade else None, "max_score": grade.max_score if grade else None,
                               "grading_type": grade.grading_type if grade else task.grading_type, "notes": grade.notes if grade else ""},
                     "insight_book": insight_book,
@@ -1096,7 +1130,8 @@ class QwenPinchBenchPipeline:
 
         server = TextBasedInsightAggregationServer(
             use_api=self.use_api, api_key=self.api_key,
-            api_provider=self.api_provider, input_dirs=[self.output_dir],
+            api_provider=self.api_provider, api_model=self.api_model,
+            input_dirs=[self.output_dir],
         )
         result = server.aggregate_and_build_encyclopedia(
             json_files=[str(f) for f in json_files], output_dir=self.output_dir,

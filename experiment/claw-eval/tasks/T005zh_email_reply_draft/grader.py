@@ -1,4 +1,4 @@
-"""T03_email_reply_draft grader — draft replies to important emails."""
+"""T005zh_email_reply_draft grader — draft replies to important emails."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ class EmailReplyDraftGrader(AbstractGrader):
 
     CLIENT_EMAIL = "client@bigcorp.com"
     BOSS_EMAIL = "boss@company.com"
+    BOSS_FALLBACK_KEYWORDS = ["竞品", "分析报告"]
 
     # ------------------------------------------------------------------ #
     # LLM Judge rubrics
@@ -178,7 +179,7 @@ agent需要起草一封合适的回复。
         )
         if boss_draft:
             completion += 0.13
-        elif "竞品" in combined_text or "分析报告" in combined_text:
+        elif any(kw in combined_text for kw in self.BOSS_FALLBACK_KEYWORDS):
             completion += 0.03
 
         # 6) Boss draft quality (0.15) — LLM Judge (from audit log)

@@ -1,4 +1,4 @@
-"""T11_newsletter_curation grader — curate tech newsletter from RSS feeds."""
+"""T021zh_newsletter_curation grader — curate tech newsletter from RSS feeds."""
 
 from __future__ import annotations
 

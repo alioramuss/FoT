@@ -1,4 +1,4 @@
-"""T05_contact_lookup grader — contact disambiguation among similar names."""
+"""T009zh_contact_lookup grader — contact disambiguation among similar names."""
 
 from __future__ import annotations
 

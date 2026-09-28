@@ -1,4 +1,4 @@
-"""T06_expense_report grader — categorize, dedup, and submit expense report."""
+"""T011zh_expense_report grader — categorize, dedup, and submit expense report."""
 
 from __future__ import annotations
 

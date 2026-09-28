@@ -1,4 +1,4 @@
-"""T02en_calendar_scheduling grader — English variant."""
+"""T004_calendar_schedulingen_calendar_scheduling grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

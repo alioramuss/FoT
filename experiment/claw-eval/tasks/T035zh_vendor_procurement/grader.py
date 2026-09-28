@@ -1,4 +1,4 @@
-"""T18_vendor_procurement grader — vendor evaluation with contradictory signals."""
+"""T035zh_vendor_procurement grader — vendor evaluation with contradictory signals."""
 
 from __future__ import annotations
 

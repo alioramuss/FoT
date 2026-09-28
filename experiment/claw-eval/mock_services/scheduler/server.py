@@ -97,7 +97,7 @@ def list_jobs(req: ListJobsRequest | None = None) -> dict[str, Any]:
         req = ListJobsRequest()
     results = []
     for j in _jobs:
-        if req.status and j.get("last_status") != req.status:
+        if req.status and req.status != "all" and j.get("last_status") != req.status:
             continue
         if req.enabled is not None and j.get("enabled") != req.enabled:
             continue

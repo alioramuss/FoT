@@ -9,9 +9,10 @@
 [![Paper](https://img.shields.io/badge/paper-arXiv-red)](https://arxiv.org/abs/2604.06132v1)
 [![Leaderboard](https://img.shields.io/badge/leaderboard-live-purple)](https://claw-eval.github.io)
 [![Dataset](https://img.shields.io/badge/🤗-Dataset-yellow)](https://huggingface.co/datasets/claw-eval/Claw-Eval)
+[![Dataset](https://img.shields.io/badge/ModelScope-MyRepo-624aff?logo=modelscope)](https://modelscope.cn/datasets/claw-eval/Claw-Eval)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
-> Claw-Eval: Toward Trustworthy Evaluation of Autonomous Agents. <br>
+> Claw-Eval: Towards Trustworthy Evaluation of Autonomous Agents. <br>
 > 300 human-verified tasks | 2,159 rubrics | 9 categories | Completion · Safety · Robustness.
 
 </div>
@@ -30,6 +31,11 @@ Browse the full leaderboard and individual task cases at **[claw-eval.github.io]
 * **Reproducibility:** We are committed to end-to-end reproducibility. Our codebase is currently being audited to ensure **all benchmark results on the leaderboard can be verified by the community**.
 * **Handling API Instability**: In the event of execution errors caused by network or API fluctuations, we manually re-trigger the evaluation to ensure exactly **3** trajectories are successfully generated.
 
+## Get Involved
+
+We sincerely thank the teams behind [Meta (Muse Spark)](https://x.com/alexandr_wang/status/2045348588734066794?s=20), [KAT-Coder-V2](https://arxiv.org/abs/2603.27703), [Kimi](https://www.kimi.com/blog/kimi-k2-6), [Qwen](https://qwen.ai/blog?id=qwen3.6), [Tencent Hunyuan](https://github.com/Tencent-Hunyuan/Hy3-preview), [Xiaomi MiMo](https://mimo.xiaomi.com/mimo-v2-5-pro), [Z.AI / GLM](https://docs.z.ai/guides/vlm/glm-5v-turbo#pure-text-coding-tasks) and [Ant Ling](https://x.com/AntLingAGI/status/2046661013639209113) for publicly referencing, evaluating on, and engaging with Claw-Eval. We are grateful for this recognition, and we hope Claw-Eval can help the community jointly build a more scientific foundation for evaluating the general agentic capabilities of foundation models.
+
+To run Claw-Eval and submit results to join the leaderboard, contact: **bwye@stu.pku.edu.cn**, **lirang410@gmail.com**, **nlp.lilei@gmail.com**.
 
 ## 📢 Updates
 * **v1.1.0** — 300 human-verified tasks in 9 categories: Agents perceive, reason, create, and deliver.
@@ -82,7 +88,7 @@ Prepare your keys and set up the environments with one command:
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
-export SERP_DEV_KEY=... # add this for tasks need real web search
+export SERP_DEV_KEY=... # add this for tasks need real web search.  You can get api key from https://www.novada.com for convenience.
 bash scripts/test_sandbox.sh
 ```
 
@@ -124,11 +130,14 @@ Our test cases are built on the work of the community. We draw from and adapt ta
 If you use Claw-Eval in your research, please cite:
 
 ```bibtex
-@misc{claw-eval2026,
-  title={Claw-Eval: End-to-End Transparent Benchmark for AI Agents in the Real World},
-  author={Ye, Bowen and Li, Rang and Yang, Qibin and Xie, Zhihui and Liu, Yuanxin and Yao, Linli and Lyu, Hanglong and Li, Lei},
-  year={2026},
-  url={https://github.com/claw-eval/claw-eval}
+@misc{ye2026clawevaltrustworthyevaluationautonomous,
+      title={Claw-Eval: Towards Trustworthy Evaluation of Autonomous Agents}, 
+      author={Bowen Ye and Rang Li and Qibin Yang and Yuanxin Liu and Linli Yao and Hanglong Lv and Zhihui Xie and Chenxin An and Lei Li and Lingpeng Kong and Qi Liu and Zhifang Sui and Tong Yang},
+      year={2026},
+      eprint={2604.06132},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2604.06132}, 
 }
 ```
 

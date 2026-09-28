@@ -1,4 +1,4 @@
-"""T42_llama_w8a8_cuda_bug grader — judge + anchor scoring."""
+"""T068zh_llama_w8a8_cuda_bug grader — judge + anchor scoring."""
 
 from __future__ import annotations
 

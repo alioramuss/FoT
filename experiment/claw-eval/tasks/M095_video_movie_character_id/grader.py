@@ -32,28 +32,28 @@ GT_CHARACTERS = [
         "name_zh": "夏洛",
         "name_en": "xialuo",
         "alt_names": ["夏洛", "xialuo", "xia luo", "charlotte"],
-        "gt_image": "/workspace/fixtures/xialuo.png",
+        "gt_local_file": "fixtures/xialuo.png",
         "description": "male student in school uniform",
     },
     {
         "name_zh": "马冬梅",
         "name_en": "madongmei",
         "alt_names": ["马冬梅", "madongmei", "ma dongmei", "ma dong mei"],
-        "gt_image": "/workspace/fixtures/madongmei.png",
+        "gt_local_file": "fixtures/madongmei.png",
         "description": "female student, school uniform with green-black striped inner shirt",
     },
     {
         "name_zh": "秋雅",
         "name_en": "qiuya",
         "alt_names": ["秋雅", "qiuya", "qiu ya"],
-        "gt_image": "/workspace/fixtures/qiuya.png",
+        "gt_local_file": "fixtures/qiuya.png",
         "description": "female student, school uniform with black polka-dot white inner shirt",
     },
     {
         "name_zh": "袁华",
         "name_en": "yuanhua",
         "alt_names": ["袁华", "yuanhua", "yuan hua"],
-        "gt_image": "/workspace/fixtures/yuanhua.png",
+        "gt_local_file": "fixtures/yuanhua.png",
         "description": "male, yellow plaid T-shirt",
     },
 ]
@@ -162,7 +162,7 @@ class Grader(AbstractGrader, MultimodalGraderMixin, VisualGraderMixin):
         portrait_score_total = 0.0
         if agent_portraits and judge and hasattr(judge, "evaluate_visual"):
             for gt_char in GT_CHARACTERS:
-                gt_entry = snapshot.get(f"file:{gt_char['gt_image']}", {})
+                gt_entry = snapshot.get(f"local_file:{gt_char['gt_local_file']}", {})
                 gt_b64 = (
                     gt_entry.get("content", "")
                     if gt_entry.get("encoding") == "base64"

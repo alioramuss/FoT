@@ -13,6 +13,8 @@ services:
     health_check_method: POST
     ready_timeout: 10
     reset_endpoint: http://localhost:9109/rss/reset
+    env:
+      RSS_FIXTURES: tasks/T022_newsletter_curation/fixtures/rss/articles.json
 
 prompt:
   text: |

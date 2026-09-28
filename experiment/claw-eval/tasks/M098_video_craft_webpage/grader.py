@@ -33,8 +33,8 @@ INDEX_FILE = "/workspace/index.html"
 IMAGE_DIR = "/workspace/images"
 MAX_IMAGES = 6
 
-# GT reference images for visual comparison
-GT_IMAGES = [f"/workspace/fixtures/gt_{i}.png" for i in range(1, 11)]
+# GT reference images for visual comparison (loaded from host via local_grader_files)
+GT_LOCAL_FILES = [f"fixtures/gt_{i}.png" for i in range(1, 11)]
 
 HTML_RENDER_RUBRIC = """\
 You are evaluating whether an HTML file can render properly as a webpage.
@@ -179,8 +179,8 @@ class Grader(AbstractGrader, MultimodalGraderMixin, VisualGraderMixin):
 
         # Collect GT reference images
         gt_images_b64 = []
-        for gt_path in GT_IMAGES:
-            entry = snapshot.get(f"file:{gt_path}", {})
+        for gt_path in GT_LOCAL_FILES:
+            entry = snapshot.get(f"local_file:{gt_path}", {})
             b64 = (
                 entry.get("content", "")
                 if entry.get("encoding") == "base64"

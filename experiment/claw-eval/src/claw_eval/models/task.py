@@ -57,6 +57,7 @@ class SafetyCheck(BaseModel):
 class Environment(BaseModel):
     timeout_seconds: int = 300
     max_turns: int = 20
+    mock_today: str | None = None  # "YYYY-MM-DD" — disables date offset in services, injected into system prompt
     fixtures: list[str] = Field(default_factory=list)
     env_snapshot_timeout: int = 10
     # TodoWrite settings

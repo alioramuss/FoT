@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import mimetypes
 import subprocess
 import time
 from pathlib import Path
@@ -25,6 +26,16 @@ from .sandbox_tools import SANDBOX_TOOL_NAMES
 _ALWAYS_MEDIA_TOOLS = frozenset({"ReadMedia", "BrowserScreenshot"})
 # Tools that conditionally return frames (e.g. Read with image/PDF)
 _CONDITIONAL_MEDIA_TOOLS = frozenset({"Read"})
+
+_IMAGE_EXTENSIONS = frozenset({
+    ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
+})
+_TEXT_EXTENSIONS = frozenset({
+    ".cfg", ".conf", ".csv", ".html", ".ini", ".json", ".jsonl", ".log",
+    ".md", ".py", ".rst", ".sh", ".toml", ".tsv", ".txt", ".xml", ".yaml",
+    ".yml",
+})
+_MAX_LOCAL_TEXT_READ_CHARS = 200_000
 
 
 def _compress_image_b64(
@@ -83,6 +94,7 @@ class SandboxToolDispatcher:
         max_images_per_turn: int = 64,
         tool_image_max_dimension: int = 1280,
         tool_image_quality: int = 60,
+        allow_image_input: bool = True,
     ) -> None:
         self._http = http_dispatcher
         self._sandbox_url = sandbox_url
@@ -90,6 +102,7 @@ class SandboxToolDispatcher:
         self._max_per_turn = max_images_per_turn
         self._max_dimension = tool_image_max_dimension
         self._image_quality = tool_image_quality
+        self._allow_image_input = allow_image_input
 
     # ---- public interface (same signature as ToolDispatcher) ---------------
 
@@ -201,7 +214,9 @@ class SandboxToolDispatcher:
             budget = self._max_per_turn
 
             # Uniform sampling when more frames than budget
-            if total_available <= budget:
+            if not self._allow_image_input:
+                selected = []
+            elif total_available <= budget:
                 selected = valid_frames
             else:
                 indices = [int(i * total_available / budget) for i in range(budget)]
@@ -220,6 +235,11 @@ class SandboxToolDispatcher:
             summary_body = {k: v for k, v in body.items() if k != "frames"}
             summary_body["frame_count"] = total_available
             summary_body["frames_shown"] = len(selected)
+            if total_available and not self._allow_image_input:
+                summary_body["note"] = (
+                    "Image content omitted because the configured model is text-only; "
+                    "use an OCR or media-extraction tool."
+                )
             if total_available > len(selected):
                 summary_body["sampling"] = f"uniform ({len(selected)} of {total_available})"
             text_content = json.dumps(summary_body, ensure_ascii=False)
@@ -275,11 +295,56 @@ class SandboxToolDispatcher:
         try:
             body = handler(tool_use.input)
             latency_ms = (time.monotonic() - t0) * 1000
-            content_text = json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)
+            is_error = isinstance(body, dict) and bool(body.get("error"))
+            extra_images: list[ImageBlock] | None = None
+            response_body = body
+
+            # Match remote sandbox behavior for Read(image): keep base64 out
+            # of textual tool results and inject a compressed image block.
+            if (
+                tool_use.name in _CONDITIONAL_MEDIA_TOOLS
+                and isinstance(body, dict)
+                and "frames" in body
+                and not is_error
+            ):
+                frames = body.get("frames") or []
+                valid_frames = [frame for frame in frames if frame.get("image_b64")]
+                selected = (
+                    valid_frames[: self._max_per_turn]
+                    if self._allow_image_input
+                    else []
+                )
+                extra_images = [
+                    ImageBlock(
+                        data=_compress_image_b64(
+                            frame["image_b64"],
+                            self._max_dimension,
+                            self._image_quality,
+                        ),
+                        mime_type="image/jpeg",
+                    )
+                    for frame in selected
+                ] or None
+                summary_body = {key: value for key, value in body.items() if key != "frames"}
+                summary_body["frame_count"] = len(valid_frames)
+                summary_body["frames_shown"] = len(selected)
+                if valid_frames and not self._allow_image_input:
+                    summary_body["note"] = (
+                        "Image content omitted because the configured model is text-only; "
+                        "use an OCR or media-extraction tool."
+                    )
+                content_text = json.dumps(summary_body, ensure_ascii=False)
+                response_body = summary_body
+            else:
+                content_text = (
+                    json.dumps(body, ensure_ascii=False)
+                    if isinstance(body, dict)
+                    else str(body)
+                )
             result = ToolResultBlock(
                 tool_use_id=tool_use.id,
                 content=[TextBlock(text=content_text)],
-                is_error=False,
+                is_error=is_error,
             )
             dispatch_event = ToolDispatch(
                 trace_id=trace_id,
@@ -287,8 +352,8 @@ class SandboxToolDispatcher:
                 tool_name=tool_use.name,
                 endpoint_url=f"local://sandbox/{tool_use.name}",
                 request_body=tool_use.input,
-                response_status=200,
-                response_body=body,
+                response_status=400 if is_error else 200,
+                response_body=response_body,
                 latency_ms=latency_ms,
             )
         except Exception as exc:
@@ -298,7 +363,7 @@ class SandboxToolDispatcher:
                 status=500, latency_ms=latency_ms,
             )
 
-        return result, dispatch_event, None
+        return result, dispatch_event, extra_images
 
     # ---- local handlers --------------------------------------------------
 
@@ -339,6 +404,43 @@ class SandboxToolDispatcher:
         path = Path(raw_path)
         if not path.exists():
             return {"error": f"File not found: {path}"}
+        if not path.is_file():
+            return {"error": f"Not a regular file: {path}"}
+
+        suffix = path.suffix.lower()
+        mime_type, _ = mimetypes.guess_type(path.name)
+
+        if suffix in _IMAGE_EXTENSIONS:
+            image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+            return {
+                "frames": [{"image_b64": image_b64}],
+                "mime_type": mime_type or "image/jpeg",
+                "size_bytes": path.stat().st_size,
+                "text_summary": f"Image: {path.name}",
+            }
+
+        if suffix == ".pdf":
+            return {
+                "error": (
+                    "PDF rendering is unavailable in local sandbox-tools mode. "
+                    "Use pdftotext or another PDF extraction tool instead of reading "
+                    "the binary file as text."
+                )
+            }
+
+        is_text = (
+            suffix in _TEXT_EXTENSIONS
+            or (mime_type is not None and mime_type.startswith("text/"))
+        )
+        if not is_text:
+            return {
+                "error": (
+                    f"Refusing to read binary file as text: {path} "
+                    f"({mime_type or 'application/octet-stream'}, "
+                    f"{path.stat().st_size} bytes)"
+                )
+            }
+
         content = path.read_text(encoding="utf-8", errors="replace")
         offset = inp.get("offset")
         limit = inp.get("limit")
@@ -351,8 +453,22 @@ class SandboxToolDispatcher:
             numbered = []
             for i, line in enumerate(selected, start=start + 1):
                 numbered.append(f"     {i}\t{line.rstrip()}")
-            return {"content": "\n".join(numbered)}
-        return {"content": content}
+            content = "\n".join(numbered)
+
+        original_chars = len(content)
+        truncated = original_chars > _MAX_LOCAL_TEXT_READ_CHARS
+        if truncated:
+            content = content[:_MAX_LOCAL_TEXT_READ_CHARS]
+            content += (
+                "\n[Read output truncated: "
+                f"{original_chars} characters; use offset/limit for smaller sections.]"
+            )
+        return {
+            "content": content,
+            "mime_type": mime_type or "text/plain",
+            "encoding": "utf-8",
+            "truncated": truncated,
+        }
 
     @staticmethod
     def _handle_file_write(inp: dict) -> dict:

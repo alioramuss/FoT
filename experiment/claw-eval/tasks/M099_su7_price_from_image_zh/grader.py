@@ -1,4 +1,4 @@
-"""T26_su7_price_from_image deterministic grader."""
+"""M099_su7_price_from_image_zh deterministic grader."""
 
 from __future__ import annotations
 

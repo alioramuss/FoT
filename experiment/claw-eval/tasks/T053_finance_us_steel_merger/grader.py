@@ -1,4 +1,4 @@
-"""T27_finance_us_steel_merger grader with judge + anchor scoring."""
+"""T053_finance_us_steel_merger grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

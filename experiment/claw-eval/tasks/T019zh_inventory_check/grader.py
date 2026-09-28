@@ -1,4 +1,4 @@
-"""T10_inventory_check grader — check stock, identify low items, place orders."""
+"""T019zh_inventory_check grader — check stock, identify low items, place orders."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""T24_oss_comparison grader — Redis vs Valkey OSS license comparison."""
+"""T047zh_oss_comparison grader — Redis vs Valkey OSS license comparison."""
 
 from __future__ import annotations
 

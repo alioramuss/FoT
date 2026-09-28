@@ -272,6 +272,9 @@ def run_task(
             max_images_per_turn=_mcfg.max_images_per_turn,
             tool_image_max_dimension=_mcfg.tool_image_max_dimension,
             tool_image_quality=_mcfg.tool_image_quality,
+            allow_image_input=model_supports_modality(
+                (model_cfg or ModelConfig()).input_modalities, "image"
+            ),
         )
     else:
         task_tools = task.tools

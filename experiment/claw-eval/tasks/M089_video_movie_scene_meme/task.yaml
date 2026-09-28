@@ -20,7 +20,9 @@ services: []
 sandbox_files:
   - fixtures/video.mp4
 
-sandbox_grader_files:
+sandbox_grader_files: []
+
+local_grader_files:
   - fixtures/gt.png
 
 env_snapshot_commands: []

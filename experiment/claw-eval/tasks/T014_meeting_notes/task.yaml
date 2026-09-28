@@ -13,6 +13,8 @@ services:
     health_check_method: POST
     ready_timeout: 10
     reset_endpoint: http://localhost:9105/notes/reset
+    env:
+      NOTES_FIXTURES: tasks/T014_meeting_notes/fixtures/notes/meetings.json
 
 prompt:
   text: "Summarize the February 23, 2026 weekly meeting key points and send to attendees."

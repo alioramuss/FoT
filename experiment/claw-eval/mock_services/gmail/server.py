@@ -39,12 +39,18 @@ def _load_fixtures() -> None:
     passes.  We compute the offset between the newest fixture date and "now"
     and shift every email forward by that amount so the agent always sees
     recent mail with the default ``days_back=7`` window.
+
+    When MOCK_TODAY is set, fixtures are already at correct dates — don't shift.
     """
     global _emails
     with open(FIXTURES_PATH) as f:
         _emails = json.load(f)
 
     if not _emails:
+        return
+
+    # When MOCK_TODAY is set, fixtures are already at correct dates — don't shift
+    if os.environ.get("MOCK_TODAY"):
         return
 
     # Find the newest date in the fixtures
@@ -110,7 +116,15 @@ def list_messages(req: ListMessagesRequest | None = None) -> dict[str, Any]:
     if req is None:
         req = ListMessagesRequest()
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=req.days_back)
+    mock_today = os.environ.get("MOCK_TODAY")
+    if mock_today:
+        # MOCK_TODAY set: no offset was applied, use MOCK_TODAY as reference
+        now = datetime.fromisoformat(mock_today + "T23:59:59+00:00")
+    else:
+        # No MOCK_TODAY: offset was applied, datetime.now() works correctly
+        now = datetime.now(timezone.utc)
+
+    cutoff = now - timedelta(days=req.days_back)
     results = []
     for email in _emails:
         email_date = datetime.fromisoformat(email["date"].replace("Z", "+00:00"))
@@ -180,7 +194,7 @@ def get_audit() -> dict[str, Any]:
     """Return all API calls for grader inspection."""
     return {
         "calls": _audit_log,
-        "sent_messages": _sent_messages,
+        "sent": _sent_messages,
         "drafts": _drafts,
     }
 

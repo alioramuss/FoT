@@ -1,4 +1,4 @@
-"""T59_officeqa_army_expenditures grader — cross-document Army expenditures comparison."""
+"""T085_officeqa_army_expenditures grader — cross-document Army expenditures comparison."""
 
 from __future__ import annotations
 

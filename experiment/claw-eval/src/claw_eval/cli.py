@@ -356,13 +356,15 @@ def cmd_run(args: argparse.Namespace) -> None:
             api_key=args.api_key or cfg.model.api_key,
             base_url=args.base_url or cfg.model.base_url,
             extra_body=cfg.model.extra_body,
+            temperature=cfg.model.temperature,
+            reasoning_effort=cfg.model.reasoning_effort,
         )
         judge = _make_judge(cfg, args)
         trials = args.trials or 1
         trial_scores: list[float] = []
         trace_paths: list[Path] = []
 
-        with ServiceManager(task.services) as svc:
+        with ServiceManager(task.services, mock_today=task.environment.mock_today) as svc:
             for i in range(trials):
                 if trials > 1:
                     print(f"\n--- Trial {i + 1}/{trials} ---")
@@ -479,6 +481,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         api_key=args.api_key or cfg.model.api_key,
         base_url=args.base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        temperature=cfg.model.temperature,
+        reasoning_effort=cfg.model.reasoning_effort,
     )
 
     judge = _make_judge(cfg, args)
@@ -490,7 +494,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     trial_scores_local: list[float] = []
     trace_paths_local: list[Path] = []
 
-    with ServiceManager(task.services) as svc:
+    with ServiceManager(task.services, mock_today=task.environment.mock_today) as svc:
         for i in range(trials):
             if trials > 1:
                 print(f"\n--- Trial {i + 1}/{trials} ---")
@@ -594,6 +598,8 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
         api_key=args.api_key or cfg.model.api_key or os.environ.get("OPENAI_API_KEY"),
         base_url=args.base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        temperature=cfg.model.temperature,
+        reasoning_effort=cfg.model.reasoning_effort,
     )
 
     sandbox_tools = getattr(args, "sandbox_tools", False)
@@ -605,7 +611,7 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
     else:
         trace_dir = _make_trace_dir(cfg.defaults.trace_dir, model_id)
 
-    with ServiceManager(task.services):
+    with ServiceManager(task.services, mock_today=task.environment.mock_today):
         trace_path = run_task(
             task, provider,
             trace_dir=trace_dir,
@@ -806,6 +812,8 @@ def _run_single_task(
         api_key=api_key or cfg.model.api_key,
         base_url=base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        temperature=cfg.model.temperature,
+        reasoning_effort=cfg.model.reasoning_effort,
     )
 
     # Build judge if needed
@@ -831,6 +839,8 @@ def _run_single_task(
         "difficulty": task.difficulty,
         "trials": [],
         "error": None,
+        "error_type": None,
+        "failure_stage": None,
     }
 
     import time
@@ -840,12 +850,15 @@ def _run_single_task(
     for attempt in range(max_retries):
         result["trials"] = []
         result["error"] = None
+        result["error_type"] = None
+        result["failure_stage"] = None
         try:
-            with ServiceManager(task.services, cwd=tasks_dir.parent) as svc:
+            with ServiceManager(task.services, cwd=tasks_dir.parent, mock_today=task.environment.mock_today) as svc:
                 for i in range(trials):
                     if i > 0:
                         svc.reset_all()
 
+                    trace_path = None
                     try:
                         env_snapshot = None
                         if sandbox_runner:
@@ -951,6 +964,13 @@ def _run_single_task(
                         result["trials"].append({
                             "trial": i,
                             "error": str(trial_exc),
+                            "error_type": type(trial_exc).__name__,
+                            # Once run_task returns a trace, any later error is
+                            # in trace loading or grading, not agent execution.
+                            "failure_stage": (
+                                "grading" if trace_path is not None
+                                else "agent_execution"
+                            ),
                             "task_score": 0.0,
                             "passed": False,
                         })
@@ -962,15 +982,22 @@ def _run_single_task(
                 time.sleep(wait)
             else:
                 result["error"] = str(e)
+                result["error_type"] = type(e).__name__
+                result["failure_stage"] = "service_setup"
         except Exception as e:
             result["error"] = str(e)
+            result["error_type"] = type(e).__name__
+            result["failure_stage"] = "service_setup"
             break  # non-retryable error
 
     # Compute multi-trial aggregate metrics (exclude errored trials)
     valid_trials = [t for t in result["trials"] if not t.get("error")]
     if not valid_trials and result["trials"]:
         # All trials errored — propagate as task-level error for summary stats
-        result["error"] = result["trials"][0].get("error", "all trials errored")
+        first_error = result["trials"][0]
+        result["error"] = first_error.get("error", "all trials errored")
+        result["error_type"] = first_error.get("error_type")
+        result["failure_stage"] = first_error.get("failure_stage")
     trial_scores = [t["task_score"] for t in valid_trials]
     n_trials = len(trial_scores)
     if n_trials > 0:

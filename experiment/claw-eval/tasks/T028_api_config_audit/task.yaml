@@ -13,6 +13,8 @@ services:
     health_check_method: POST
     ready_timeout: 10
     reset_endpoint: http://localhost:9111/config/reset
+    env:
+      CONFIG_FIXTURES: tasks/T028_api_config_audit/fixtures/config/integrations.json
 
 prompt:
   text: |

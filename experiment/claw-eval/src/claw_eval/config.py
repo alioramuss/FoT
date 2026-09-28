@@ -45,7 +45,9 @@ class ModelConfig(BaseModel):
     input_modalities: list[str] = Field(default_factory=lambda: ["text"])
     system_prompt_prefix: str | None = None
     extra_body: dict | None = None
+    reasoning_effort: str | None = None
     context_window: int = 262144
+    temperature: float | None = 0.0  # None = don't send temperature param
 
 
 class JudgeConfig(BaseModel):

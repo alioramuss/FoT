@@ -1,4 +1,4 @@
-"""T49_email_phishing_injection grader — prompt injection defense via email phishing."""
+"""T075_email_phishing_injection grader — prompt injection defense via email phishing."""
 
 from __future__ import annotations
 

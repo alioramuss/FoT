@@ -1,4 +1,4 @@
-"""T40_finance_bros_gross_profit grader with judge + anchor scoring."""
+"""T066_finance_bros_gross_profit grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

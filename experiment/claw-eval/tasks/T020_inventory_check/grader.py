@@ -1,4 +1,4 @@
-"""T10en_inventory_check grader — English variant."""
+"""T020_inventory_checken_inventory_check grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

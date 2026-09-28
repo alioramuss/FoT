@@ -73,17 +73,18 @@ tools:
       required: [message_id]
 
   - name: calendar_list_events
-    description: List calendar events
+    description: Get calendar events within a specified date range
     input_schema:
       type: object
       properties:
-        start_date:
+        date:
           type: string
-          description: "Start date (YYYY-MM-DD)"
-        end_date:
-          type: string
-          description: "End date (YYYY-MM-DD)"
-      required: []
+          description: "Query date (YYYY-MM-DD)"
+        days:
+          type: integer
+          description: "Number of days to query"
+          default: 1
+      required: [date]
 
   - name: calendar_get_event
     description: Get event details
@@ -139,6 +140,7 @@ tool_endpoints:
     method: POST
 
 environment:
+  mock_today: "2026-03-25"
   timeout_seconds: 600
   max_turns: 30
 

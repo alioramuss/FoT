@@ -1,4 +1,4 @@
-"""T35_finance_mu_gm_beat grader with judge + anchor scoring."""
+"""T061_finance_mu_gm_beat grader with judge + anchor scoring."""
 
 from __future__ import annotations
 

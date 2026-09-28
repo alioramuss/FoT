@@ -225,6 +225,7 @@ sandbox_files:
   - fixtures/calendar/events.json
 
 environment:
+  mock_today: "2026-03-03"
   timeout_seconds: 600
   max_turns: 30
 

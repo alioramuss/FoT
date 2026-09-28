@@ -50,6 +50,7 @@ def _log_call(endpoint: str, request_body: dict[str, Any], response_body: Any) -
 
 class ListProductsRequest(BaseModel):
     category: str | None = None
+    status: str | None = None
 
 
 class GetProductRequest(BaseModel):
@@ -69,6 +70,8 @@ def list_products(req: ListProductsRequest | None = None) -> dict[str, Any]:
     results = []
     for p in _products:
         if req.category and p["category"] != req.category:
+            continue
+        if req.status and req.status != "all" and p.get("status") != req.status:
             continue
         results.append(copy.deepcopy(p))
     resp = {"products": results, "total": len(results)}

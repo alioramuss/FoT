@@ -55,17 +55,18 @@ prompt:
 
 tools:
   - name: calendar_list_events
-    description: 查看日历事件
+    description: 获取指定日期范围内的日历事件
     input_schema:
       type: object
       properties:
-        start_date:
+        date:
           type: string
-          description: "起始日期(YYYY-MM-DD)"
-        end_date:
-          type: string
-          description: "截止日期(YYYY-MM-DD)"
-      required: []
+          description: "查询日期 (YYYY-MM-DD)"
+        days:
+          type: integer
+          description: "查询天数"
+          default: 1
+      required: [date]
   - name: calendar_get_event
     description: 获取事件详情
     input_schema:
@@ -161,6 +162,7 @@ tool_endpoints:
     method: POST
 
 environment:
+  mock_today: "2026-03-24"
   timeout_seconds: 600
   max_turns: 35
 

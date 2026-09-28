@@ -13,6 +13,8 @@ services:
     health_check_method: POST
     ready_timeout: 10
     reset_endpoint: http://localhost:9106/kb/reset
+    env:
+      KB_FIXTURES: tasks/T016_kb_search/fixtures/kb/articles.json
 
 prompt:
   text: "My VPN won't connect — search the knowledge base for a fix."

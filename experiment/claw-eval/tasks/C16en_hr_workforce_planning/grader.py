@@ -82,13 +82,13 @@ Compare the assistant's answer against the reference answer above:
 ## Key dimensions
 - Did the assistant recognize the shift from "tool recommendation" to "build the model for me" when urgency was revealed?
 - Did the assistant track evolving requirements (VP review moved to Friday, no time for new tools)?
-- Tool use: did it use Bash to build actual scenario calculations?
-- Search: did it search for BambooHR integration options or workforce planning best practices?
+- Did the assistant adapt its approach smoothly instead of repeating earlier suggestions?
+- Did the conversation flow naturally, gathering information progressively?
 
 Scoring:
-- 1.0: Perfect intent tracking, adapted to urgency, efficient tool use
-- 0.7-0.9: Good tracking, minor gaps
-- 0.4-0.6: Missed the urgency pivot or poor tool use
+- 1.0: Perfect intent tracking, adapted to urgency, smooth conversation flow
+- 0.7-0.9: Good tracking, minor gaps in adaptation
+- 0.4-0.6: Missed the urgency pivot or kept recommending tools after user said no time
 - 0.0-0.3: Failed to track user intent"""
 
     NUMERICAL_RUBRIC = """Evaluate numerical accuracy of workforce scenario modeling (0.0-1.0).

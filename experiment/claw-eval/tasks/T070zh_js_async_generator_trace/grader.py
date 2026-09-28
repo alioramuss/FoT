@@ -1,4 +1,4 @@
-"""T44_js_async_generator_trace grader — judge + anchor scoring."""
+"""T070zh_js_async_generator_trace grader — judge + anchor scoring."""
 
 from __future__ import annotations
 

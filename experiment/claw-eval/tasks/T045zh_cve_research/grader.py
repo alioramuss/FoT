@@ -1,4 +1,4 @@
-"""T23_cve_research grader — CVE-2021-44228 (Log4Shell) security research."""
+"""T045zh_cve_research grader — CVE-2021-44228 (Log4Shell) security research."""
 
 from __future__ import annotations
 

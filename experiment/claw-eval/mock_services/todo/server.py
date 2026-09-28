@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Mock Todo API")
 
@@ -29,6 +29,7 @@ _tasks: list[dict[str, Any]] = []
 _audit_log: list[dict[str, Any]] = []
 _deleted: list[dict[str, Any]] = []
 _updated_tasks: list[dict[str, Any]] = []
+_created_tasks: list[dict[str, Any]] = []
 
 
 def _load_fixtures() -> None:
@@ -51,6 +52,7 @@ def _log_call(endpoint: str, request_body: dict[str, Any], response_body: Any) -
 
 class ListTasksRequest(BaseModel):
     status: str = "all"
+    priority: str | None = None
 
 
 class UpdateTaskRequest(BaseModel):
@@ -59,6 +61,7 @@ class UpdateTaskRequest(BaseModel):
     priority: str | None = None
     status: str | None = None
     tags: list[str] | None = None
+    description: str | None = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -66,9 +69,14 @@ class CreateTaskRequest(BaseModel):
     description: str | None = None
     priority: str = "medium"
     due_date: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class DeleteTaskRequest(BaseModel):
+    task_id: str
+
+
+class GetTaskRequest(BaseModel):
     task_id: str
 
 
@@ -79,9 +87,23 @@ def list_tasks(req: ListTasksRequest | None = None) -> dict[str, Any]:
     results = []
     for t in _tasks:
         if req.status == "all" or t["status"] == req.status:
+            if req.priority and t.get("priority") != req.priority:
+                continue
             results.append(copy.deepcopy(t))
     resp = {"tasks": results, "total": len(results)}
     _log_call("/todo/tasks", req.model_dump(), resp)
+    return resp
+
+
+@app.post("/todo/tasks/get")
+def get_task(req: GetTaskRequest) -> dict[str, Any]:
+    for t in _tasks:
+        if t["task_id"] == req.task_id:
+            resp = copy.deepcopy(t)
+            _log_call("/todo/tasks/get", req.model_dump(), resp)
+            return resp
+    resp = {"error": f"Task {req.task_id} not found"}
+    _log_call("/todo/tasks/get", req.model_dump(), resp)
     return resp
 
 
@@ -97,6 +119,8 @@ def update_task(req: UpdateTaskRequest) -> dict[str, Any]:
                 t["status"] = req.status
             if req.tags is not None:
                 t["tags"] = req.tags
+            if req.description is not None:
+                t["description"] = req.description
             updated = copy.deepcopy(t)
             _updated_tasks.append(updated)
             resp = {"status": "updated", "task": updated}
@@ -117,10 +141,11 @@ def create_task(req: CreateTaskRequest) -> dict[str, Any]:
         "status": "pending",
         "priority": req.priority,
         "due_date": req.due_date,
-        "tags": [],
+        "tags": req.tags,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _tasks.append(task)
+    _created_tasks.append(copy.deepcopy(task))
     resp = {"status": "created", "task": task}
     _log_call("/todo/tasks/create", req.model_dump(), resp)
     return resp
@@ -142,15 +167,16 @@ def delete_task(req: DeleteTaskRequest) -> dict[str, Any]:
 
 @app.get("/todo/audit")
 def get_audit() -> dict[str, Any]:
-    return {"calls": _audit_log, "deleted": _deleted, "updated_tasks": _updated_tasks}
+    return {"calls": _audit_log, "deleted": _deleted, "updated_tasks": _updated_tasks, "created_tasks": _created_tasks}
 
 
 @app.post("/todo/reset")
 def reset_state() -> dict[str, str]:
-    global _audit_log, _deleted, _updated_tasks
+    global _audit_log, _deleted, _updated_tasks, _created_tasks
     _audit_log = []
     _deleted = []
     _updated_tasks = []
+    _created_tasks = []
     _load_fixtures()
     return {"status": "reset"}
 

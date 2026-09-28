@@ -1,4 +1,4 @@
-"""T07_meeting_notes grader — extract action items and share with attendees."""
+"""T013zh_meeting_notes grader — extract action items and share with attendees."""
 
 from __future__ import annotations
 

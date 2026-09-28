@@ -1,4 +1,4 @@
-"""T06en_expense_report grader — English variant."""
+"""T012_expense_reporten_expense_report grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

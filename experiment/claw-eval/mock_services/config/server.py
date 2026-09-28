@@ -56,6 +56,7 @@ def _log_call(endpoint: str, request_body: dict[str, Any], response_body: Any) -
 
 class ListIntegrationsRequest(BaseModel):
     status: str | None = None
+    type: str | None = None
 
 
 class GetIntegrationRequest(BaseModel):
@@ -80,7 +81,9 @@ def list_integrations(req: ListIntegrationsRequest | None = None) -> dict[str, A
         req = ListIntegrationsRequest()
     results = []
     for intg in _integrations:
-        if req.status and intg["status"] != req.status:
+        if req.status and req.status != "all" and intg["status"] != req.status:
+            continue
+        if req.type and intg.get("service") != req.type:
             continue
         # Return summary (without secrets) in list view
         results.append({

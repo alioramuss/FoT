@@ -1,4 +1,7 @@
 *.pyc
-/tests
+/tests/*
+!/tests/test_fot_server.py
+!/tests/test_fot_client.py
 /src/fotclaw.egg-info
 /.fot
+.DS_Store

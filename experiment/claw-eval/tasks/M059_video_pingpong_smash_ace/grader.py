@@ -1,4 +1,4 @@
-"""T146_video_pingpong_smash_ace grader — ping pong smash ace count."""
+"""M059_video_pingpong_smash_ace grader — ping pong smash ace count."""
 
 from __future__ import annotations
 

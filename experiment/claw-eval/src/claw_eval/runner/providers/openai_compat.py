@@ -271,6 +271,28 @@ def _extract_thought_signature_from_tool_call(tc: Any) -> str | None:
     return None
 
 
+def _normalize_tool_call_index(value: Any, fallback: int) -> int:
+    """Normalize non-standard streamed tool-call indices to an integer.
+
+    OpenAI specifies an integer ``index``, but some OpenRouter providers have
+    emitted ``[0]`` or numeric strings. Using the raw list as a dictionary key
+    raises ``TypeError: unhashable type: 'list'`` and incorrectly aborts the
+    entire benchmark task.
+    """
+    while isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    if isinstance(value, bool):
+        return int(fallback)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    return int(fallback)
+
+
 def _exception_debug_text(exc: Exception) -> str:
     parts = [f"{type(exc).__name__}: {exc}"]
     for attr in ("status_code", "code", "type", "param"):
@@ -309,9 +331,13 @@ class OpenAICompatProvider:
         api_key: str | None = None,
         base_url: str | None = None,
         extra_body: dict | None = None,
+        temperature: float | None = 0.0,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.model_id = model_id
         self.extra_body = extra_body or {}
+        self.temperature = temperature
+        self.reasoning_effort = reasoning_effort
         self._include_reasoning_history = not (
             base_url and "generativelanguage.googleapis.com" in base_url
         )
@@ -319,6 +345,7 @@ class OpenAICompatProvider:
         self.client = OpenAI(
             api_key=resolved_key,
             base_url=base_url,
+            timeout=300.0,
         )
 
     def chat(
@@ -348,16 +375,19 @@ class OpenAICompatProvider:
         kwargs: dict[str, Any] = {
             "model": self.model_id,
             "messages": oai_messages,
-            "temperature": 0.0,
         }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if self.extra_body:
             kwargs["extra_body"] = dict(self.extra_body)
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = [_tool_spec_to_openai(t) for t in tools]
 
-        max_retries = 20
+        max_retries = 5
         last_exc: Exception | None = None
-        use_stream = False  # default
+        use_stream = True  # default
         for attempt in range(max_retries + 1):
             try:
                 if attempt <= 1 and not use_stream:
@@ -456,6 +486,11 @@ class OpenAICompatProvider:
                 continue
             has_any_choice = True
             delta = chunk.choices[0].delta
+            if delta is None:
+                # Some non-standard endpoints (e.g. MindGPT) omit the `delta`
+                # field on the terminal chunk that carries finish_reason/usage.
+                # Standard OpenAI-compatible servers always send `delta: {}`.
+                continue
 
             # reasoning_content (thinking models: DeepSeek-R1, QwQ, etc.)
             # OpenRouter returns "reasoning" instead of "reasoning_content"
@@ -469,8 +504,10 @@ class OpenAICompatProvider:
 
             # tool_calls (streamed incrementally)
             if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
+                for fallback_idx, tc_delta in enumerate(delta.tool_calls):
+                    idx = _normalize_tool_call_index(
+                        getattr(tc_delta, "index", None), fallback_idx
+                    )
                     if idx not in tool_calls_by_index:
                         tool_calls_by_index[idx] = {"id": "", "name": "", "arguments": "", "thought_signature": None}
                     if tc_delta.id:

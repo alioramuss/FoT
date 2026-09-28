@@ -10,7 +10,8 @@ grading harness, then implements an ExpeL-style train/eval workflow:
   1. Load PinchBench tasks and split them in deterministic loader order.
   2. Train on the first half with repeated reflection trials.
   3. Extract ExpeL rules from successful and failed trajectories.
-  4. Index successful trajectories in Gemini File Search.
+  4. Index successful trajectories in Gemini File Search or a local
+     OpenRouter-embedding vector index.
   5. Evaluate on the second half with rules and retrieved trajectories
      prepended directly to the task prompt.
 """
@@ -18,7 +19,9 @@ grading harness, then implements an ExpeL-style train/eval workflow:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -44,6 +47,7 @@ from lib_agent import (  # type: ignore
 )
 from lib_grading import GradeResult, grade_task  # type: ignore
 from lib_tasks import Task, TaskLoader  # type: ignore
+from utils import call_openrouter, normalize_api_model, resolve_api_key
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +288,35 @@ class GeminiCaller:
         return text, token_info
 
 
+class OpenRouterCaller:
+    """OpenRouter-backed replacement for ExpeL reflection and rule calls."""
+
+    def __init__(self, api_key: Optional[str], model_name: str) -> None:
+        self.api_key = resolve_api_key("openrouter", api_key)
+        if not self.api_key:
+            raise ValueError(
+                "OpenRouter API key is required via --api-key or OPENROUTER_API_KEY"
+            )
+        model = model_name
+        if "/" not in model.removeprefix("openrouter/"):
+            model = f"google/{model}"
+        self.model_name = normalize_api_model("openrouter", model)
+
+    def generate(
+        self,
+        prompt: str,
+        max_output_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> Tuple[str, Dict[str, Any]]:
+        return call_openrouter(
+            self.api_key,
+            self.model_name,
+            prompt,
+            max_new_tokens=max_output_tokens,
+            temperature=temperature,
+        )
+
+
 def extract_response_text(response: Any) -> str:
     text = getattr(response, "text", None)
     if isinstance(text, str) and text.strip():
@@ -416,6 +449,178 @@ class GeminiFileSearch:
             token_info["thinking_tokens"] = getattr(usage, "thoughts_token_count", 0)
             token_info["total_tokens"] = getattr(usage, "total_token_count", None)
         return text, token_info
+
+
+class OpenRouterLocalRAG:
+    """Persisted local vector index backed by OpenRouter embeddings."""
+
+    def __init__(
+        self,
+        api_key: Optional[str],
+        embedding_model: str,
+        output_dir: Path,
+        existing_index_path: Optional[str] = None,
+    ) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "openai is required for OpenRouter embeddings: pip install openai"
+            ) from exc
+
+        self.api_key = resolve_api_key("openrouter", api_key)
+        if not self.api_key:
+            raise ValueError(
+                "OpenRouter API key is required via --api-key or OPENROUTER_API_KEY"
+            )
+        self.embedding_model = normalize_api_model("openrouter", embedding_model)
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.api_key,
+        )
+        self.output_dir = output_dir
+        self.explicit_existing_index = bool(existing_index_path)
+        self.index_path = (
+            Path(existing_index_path).expanduser()
+            if existing_index_path
+            else output_dir / "openrouter_rag_index.json"
+        )
+        self.store_name = str(self.index_path)
+        self.store_display_name = self.index_path.name
+        self.chunks: List[Dict[str, Any]] = []
+        self.last_index_token_info: Dict[str, Any] = {}
+
+    @staticmethod
+    def _chunk_corpus(
+        corpus_text: str,
+        *,
+        chunk_chars: int = 2400,
+        overlap_chars: int = 320,
+    ) -> List[str]:
+        chunks: List[str] = []
+        for document in corpus_text.split("\n\n---\n\n"):
+            document = document.strip()
+            if not document:
+                continue
+            start = 0
+            while start < len(document):
+                end = min(len(document), start + chunk_chars)
+                chunk = document[start:end].strip()
+                if chunk:
+                    chunks.append(chunk)
+                if end >= len(document):
+                    break
+                start = max(start + 1, end - overlap_chars)
+        return chunks
+
+    def _embed(
+        self,
+        texts: List[str],
+        *,
+        input_type: str,
+    ) -> Tuple[List[List[float]], Dict[str, Any]]:
+        if not texts:
+            return [], {}
+        kwargs: Dict[str, Any] = {
+            "model": self.embedding_model,
+            "input": texts,
+        }
+        # OpenRouter supports this search_document/search_query hint, but some
+        # OpenAI SDK versions do not expose it in their typed signature.
+        kwargs["extra_body"] = {"input_type": input_type}
+        response = self.client.embeddings.create(**kwargs)
+        ordered = sorted(response.data, key=lambda item: item.index)
+        vectors = [list(item.embedding) for item in ordered]
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        return vectors, {
+            "backend": "openrouter",
+            "model": self.embedding_model,
+            "input_tokens": input_tokens,
+            "total_tokens": getattr(usage, "total_tokens", input_tokens)
+            if usage
+            else input_tokens,
+            "cost_usd": getattr(usage, "cost", 0.0) if usage else 0.0,
+            "request_count": 1,
+        }
+
+    def create_or_reuse_store(self, corpus_text: str) -> Optional[str]:
+        corpus_sha256 = hashlib.sha256(corpus_text.encode("utf-8")).hexdigest()
+        if self.index_path.exists():
+            payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+            if payload.get("embedding_model") != self.embedding_model:
+                raise ValueError(
+                    "Existing RAG index uses embedding model "
+                    f"{payload.get('embedding_model')!r}, expected "
+                    f"{self.embedding_model!r}"
+                )
+            same_corpus = payload.get("corpus_sha256") == corpus_sha256
+            if self.explicit_existing_index or same_corpus or not corpus_text:
+                self.chunks = list(payload.get("chunks", []))
+                if not self.chunks:
+                    raise ValueError(
+                        f"Existing RAG index is empty: {self.index_path}"
+                    )
+                return self.store_name
+
+        texts = self._chunk_corpus(corpus_text)
+        vectors, token_info = self._embed(texts, input_type="search_document")
+        self.last_index_token_info = token_info
+        self.chunks = [
+            {"text": text, "embedding": vector}
+            for text, vector in zip(texts, vectors)
+        ]
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(
+            self.index_path,
+            {
+                "provider": "openrouter",
+                "embedding_model": self.embedding_model,
+                "corpus_sha256": corpus_sha256,
+                "token_info": token_info,
+                "chunks": self.chunks,
+            },
+        )
+        return self.store_name
+
+    @staticmethod
+    def _cosine(left: List[float], right: List[float]) -> float:
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    def retrieve(self, task_prompt: str, top_k: int) -> Tuple[str, Dict[str, Any]]:
+        if not self.chunks and self.index_path.exists():
+            self.create_or_reuse_store("")
+        if not self.chunks:
+            return "", {}
+        vectors, token_info = self._embed(
+            [task_prompt], input_type="search_query"
+        )
+        query_vector = vectors[0]
+        ranked = sorted(
+            (
+                (self._cosine(query_vector, chunk["embedding"]), chunk["text"])
+                for chunk in self.chunks
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )[: max(1, top_k)]
+        retrieved = "\n\n".join(
+            f"[Retrieved trajectory {index}; similarity={score:.4f}]\n{text}"
+            for index, (score, text) in enumerate(ranked, 1)
+        )
+        token_info.update(
+            {
+                "top_k": top_k,
+                "index_path": str(self.index_path),
+                "chunks_searched": len(self.chunks),
+            }
+        )
+        return retrieved, token_info
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +793,8 @@ class OpenClawPinchBenchExpel:
         timeout_multiplier: float,
         base_url: Optional[str],
         openclaw_api_key: Optional[str],
+        api_provider: str = "gemini",
+        rag_embedding_model: Optional[str] = None,
     ) -> None:
         self.model_id = model_id
         self.output_dir = Path(output_dir)
@@ -595,9 +802,45 @@ class OpenClawPinchBenchExpel:
         self.pinchbench_dir = Path(pinchbench_dir) if pinchbench_dir else Path(__file__).parent / "pinchbench"
         self.tasks_dir = self.pinchbench_dir / "tasks"
         self.skill_dir = self.pinchbench_dir
-        self.judge_model = judge_model or model_id
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        self.api_model = api_model
+        self.api_provider = api_provider.strip().lower()
+        if self.api_provider not in {"gemini", "openrouter"}:
+            raise ValueError("api_provider must be 'gemini' or 'openrouter'")
+        self.api_key = resolve_api_key(self.api_provider, api_key)
+        if not self.api_key:
+            env_name = (
+                "OPENROUTER_API_KEY"
+                if self.api_provider == "openrouter"
+                else "GEMINI_API_KEY"
+            )
+            raise ValueError(
+                f"{env_name} is required via --api-key or the environment"
+            )
+        if self.api_provider == "openrouter":
+            os.environ["OPENROUTER_API_KEY"] = self.api_key
+            api_model = (
+                api_model
+                if "/" in api_model.removeprefix("openrouter/")
+                else f"google/{api_model}"
+            )
+            self.api_model = normalize_api_model("openrouter", api_model)
+            requested_judge = judge_model or model_id
+            self.judge_model = (
+                requested_judge
+                if requested_judge.startswith("openrouter/")
+                else f"openrouter/{requested_judge}"
+            )
+        else:
+            os.environ["GEMINI_API_KEY"] = self.api_key
+            self.api_model = api_model.removeprefix("google/")
+            self.judge_model = judge_model or model_id
+        self.rag_embedding_model = (
+            rag_embedding_model
+            or (
+                "openai/text-embedding-3-small"
+                if self.api_provider == "openrouter"
+                else "models/gemini-embedding-2"
+            )
+        )
         self.thinking_level = thinking_level
         self.max_reflection_depth = max_reflection_depth
         self.max_rules = max_rules
@@ -610,7 +853,11 @@ class OpenClawPinchBenchExpel:
         self.openclaw_api_key = openclaw_api_key
         self.agent_id = f"pinchbench-expel-{slugify_model(model_id)}"
 
-        self.gemini = GeminiCaller(self.api_key, self.api_model, self.thinking_level)
+        self.model_caller = (
+            OpenRouterCaller(self.api_key, self.api_model)
+            if self.api_provider == "openrouter"
+            else GeminiCaller(self.api_key, self.api_model, self.thinking_level)
+        )
         self.rule_items_with_count: List[Tuple[str, int]] = []
         self.critique_log = ""
         self.success_trajectories: List[ExpelTrajectory] = []
@@ -618,13 +865,14 @@ class OpenClawPinchBenchExpel:
         self.reflection_records: List[Dict[str, Any]] = []
         self.token_records: List[Dict[str, Any]] = []
         self.attempt_records: List[Dict[str, Any]] = []
-        self.rag: Optional[GeminiFileSearch] = None
+        self.rag: Optional[Any] = None
 
     def _run_config(self) -> Dict[str, Any]:
         return {
             "model_id": self.model_id,
             "suite": self.suite,
             "judge_model": self.judge_model,
+            "api_provider": self.api_provider,
             "api_model": self.api_model,
             "thinking_level": self.thinking_level,
             "max_reflection_depth": self.max_reflection_depth,
@@ -634,6 +882,7 @@ class OpenClawPinchBenchExpel:
             "rag_top_k": self.rag_top_k,
             "rag_store": self.rag_store_name,
             "rag_display_name": self.rag_display_name,
+            "rag_embedding_model": self.rag_embedding_model,
             "timeout_multiplier": self.timeout_multiplier,
         }
 
@@ -709,11 +958,20 @@ class OpenClawPinchBenchExpel:
         effective_api_key = self.openclaw_api_key
         effective_model_id = self.model_id
 
-        if self.model_id.startswith("google/") or self.model_id.startswith("gemini/"):
+        if self.api_provider == "gemini" and (
+            self.model_id.startswith("google/")
+            or self.model_id.startswith("gemini/")
+        ):
             effective_base_url = effective_base_url or "https://generativelanguage.googleapis.com/v1beta/openai"
             effective_api_key = effective_api_key or self.api_key or os.getenv("GEMINI_API_KEY")
             effective_model_id = self.model_id.split("/", 1)[1]
             print("Using Gemini OpenAI-compatible endpoint for OpenClaw agent")
+        elif self.api_provider == "openrouter":
+            effective_api_key = (
+                effective_api_key
+                or self.api_key
+                or os.getenv("OPENROUTER_API_KEY")
+            )
 
         if effective_base_url:
             print(f"Using custom OpenClaw base URL: {effective_base_url}")
@@ -772,7 +1030,6 @@ class OpenClawPinchBenchExpel:
                 skill_dir=self.skill_dir,
                 judge_model=self.judge_model,
                 judge_backend="api",
-                judge_api_key=self.api_key,
             )
         except Exception as exc:
             print(f"    Warning: grading failed for {task.task_id}: {exc}")
@@ -847,7 +1104,7 @@ FAILED TRIAL:
 """
 
     def _generate_reflection(self, task: Task, trajectory: ExpelTrajectory) -> Tuple[str, Dict[str, Any]]:
-        text, token_info = self.gemini.generate(
+        text, token_info = self.model_caller.generate(
             self._reflection_prompt(task, trajectory),
             max_output_tokens=1024,
             temperature=0.0,
@@ -946,7 +1203,7 @@ FAILED TRIAL:
                 if attempt < attempts_allowed:
                     reflection, reflection_tokens = self._generate_reflection(task, trajectory)
                     self._record_token_usage(
-                        stage="gemini_reflection",
+                        stage=f"{self.api_provider}_reflection",
                         token_info=reflection_tokens,
                         metadata={
                             "task_id": task.task_id,
@@ -1083,9 +1340,9 @@ By examining the successful trials, and the list of existing rules, you can perf
                         if task_id in task_by_id
                         else success.task_prompt,
                     )
-                    llm_output, token_info = self.gemini.generate(prompt, max_output_tokens=2048, temperature=0.0)
+                    llm_output, token_info = self.model_caller.generate(prompt, max_output_tokens=2048, temperature=0.0)
                     self._record_token_usage(
-                        stage="gemini_rule_compare",
+                        stage=f"{self.api_provider}_rule_compare",
                         token_info=token_info,
                         metadata={
                             "task_id": task_id,
@@ -1116,9 +1373,9 @@ By examining the successful trials, and the list of existing rules, you can perf
                 fail_history=None,
                 task_prompt=None,
             )
-            llm_output, token_info = self.gemini.generate(prompt, max_output_tokens=2048, temperature=0.0)
+            llm_output, token_info = self.model_caller.generate(prompt, max_output_tokens=2048, temperature=0.0)
             self._record_token_usage(
-                stage="gemini_rule_success",
+                stage=f"{self.api_provider}_rule_success",
                 token_info=token_info,
                 metadata={
                     "task_ids": [task_id for task_id, _ in chunk],
@@ -1162,30 +1419,50 @@ By examining the successful trials, and the list of existing rules, you can perf
 
     def build_rag_store(self) -> None:
         if not self.success_trajectories:
-            print("No successful training trajectories; skipping File Search store creation")
+            print("No successful training trajectories; skipping RAG index creation")
             return
 
         corpus = "\n\n---\n\n".join(
             f"Source task: {t.task_id}\nTask name: {t.task_name}\n\n{t.trajectory_text(max_chars=16000)}"
             for t in self.success_trajectories
         )
-        self.rag = GeminiFileSearch(
-            api_key=self.api_key,
-            model_name=self.api_model,
-            output_dir=self.output_dir,
-            display_name=self.rag_display_name,
-            existing_store_name=self.rag_store_name,
-        )
+        if self.api_provider == "openrouter":
+            self.rag = OpenRouterLocalRAG(
+                api_key=self.api_key,
+                embedding_model=self.rag_embedding_model,
+                output_dir=self.output_dir,
+                existing_index_path=self.rag_store_name,
+            )
+        else:
+            self.rag = GeminiFileSearch(
+                api_key=self.api_key,
+                model_name=self.api_model,
+                output_dir=self.output_dir,
+                display_name=self.rag_display_name,
+                existing_store_name=self.rag_store_name,
+            )
         store_name = self.rag.create_or_reuse_store(corpus)
+        index_token_info = getattr(self.rag, "last_index_token_info", {})
+        if index_token_info:
+            self._record_token_usage(
+                stage=f"{self.api_provider}_rag_index",
+                token_info=index_token_info,
+                metadata={
+                    "embedding_model": self.rag_embedding_model,
+                    "source_success_trajectories": len(self.success_trajectories),
+                },
+            )
         _safe_write_json(
             self.output_dir / "rag_store.json",
             {
                 "store_name": store_name,
+                "provider": self.api_provider,
+                "embedding_model": self.rag_embedding_model,
                 "display_name": self.rag.store_display_name,
                 "source_success_trajectories": len(self.success_trajectories),
             },
         )
-        print(f"Gemini File Search store ready: {store_name}")
+        print(f"{self.api_provider} RAG index ready: {store_name}")
 
     def _eval_prompt(self, task: Task, retrieved: str) -> str:
         retrieved_section = retrieved.strip() or "(No retrieved successful trajectories.)"
@@ -1195,7 +1472,7 @@ The following are experiences gathered from successful and failed PinchBench tra
 EXPEL RULES:
 {self.rules_text()}
 
-RELEVANT SUCCESSFUL TRAJECTORIES RETRIEVED FROM GOOGLE FILE SEARCH:
+RELEVANT SUCCESSFUL TRAJECTORIES RETRIEVED FROM {self.api_provider.upper()} RAG:
 {retrieved_section}
 
 Now complete the original task exactly as requested.
@@ -1220,7 +1497,7 @@ ORIGINAL TASK:
                 try:
                     retrieved, rag_tokens = self.rag.retrieve(_task_full_prompt(task), self.rag_top_k)
                     self._record_token_usage(
-                        stage="gemini_rag_retrieval",
+                        stage=f"{self.api_provider}_rag_retrieval",
                         token_info=rag_tokens,
                         metadata={
                             "task_id": task.task_id,
@@ -1371,27 +1648,83 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Standalone ExpeL-style OpenClaw PinchBench runner"
     )
-    parser.add_argument("--model", default=None, help="OpenClaw model identifier. Defaults to --judge, then google/--api-model.")
+    parser.add_argument("--model", default=None, help="OpenClaw model identifier. Defaults to --judge, then --api-model.")
     parser.add_argument("--output-dir", default="pinchbench_expel_output")
     parser.add_argument("--suite", default="all", help='"all", "automated-only", or comma-separated task IDs.')
     parser.add_argument("--pinchbench-dir", default=None)
     parser.add_argument("--judge", default=None, help="Judge model; defaults to --model.")
-    parser.add_argument("--api-key", default=None, help="Gemini API key for ExpeL reflection/rule/RAG calls.")
-    parser.add_argument("--api-model", default="gemini-3-pro-preview", help="Gemini model for ExpeL reflection/rule/RAG calls.")
+    parser.add_argument(
+        "--api-provider",
+        choices=["gemini", "openrouter"],
+        default=None,
+        help=(
+            "Provider for ExpeL reflection, rule, and RAG calls. If omitted, "
+            "OpenRouter is selected when only OPENROUTER_API_KEY is available."
+        ),
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Provider API key, or use GEMINI_API_KEY / OPENROUTER_API_KEY.",
+    )
+    parser.add_argument(
+        "--api-model",
+        default=None,
+        help=(
+            "Model for ExpeL reflection and rule calls. Defaults to "
+            "gemini-3-pro-preview for Google or "
+            "google/gemini-3.1-pro-preview for OpenRouter."
+        ),
+    )
     parser.add_argument("--thinking-level", default="high", choices=["low", "medium", "high"])
     parser.add_argument("--max-reflection-depth", type=int, default=3)
     parser.add_argument("--max-rules", type=int, default=20)
     parser.add_argument("--success-critique-num", type=int, default=8)
     parser.add_argument("--rag-top-k", type=int, default=3)
-    parser.add_argument("--rag-store", nargs="?", const="", default=None, help="Enable RAG File Search store. Pass a store name to reuse an existing one, or pass the flag alone to create a new store.")
+    parser.add_argument(
+        "--rag-store",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "Reuse a Google File Search store name or, in OpenRouter mode, "
+            "a local JSON vector-index path. Omit the value to create a new index."
+        ),
+    )
     parser.add_argument("--rag-display-name", default=None, help="Display name for a new/reused File Search store.")
+    parser.add_argument(
+        "--rag-embedding-model",
+        default=None,
+        help=(
+            "RAG embedding model. Defaults to models/gemini-embedding-2 for "
+            "Google or openai/text-embedding-3-small for OpenRouter."
+        ),
+    )
     parser.add_argument("--timeout-multiplier", type=float, default=1.0)
     parser.add_argument("--iterations", type=int, default=1, help="Compatibility only; ExpeL runner always performs one train/eval split.")
     parser.add_argument("--base-url", default=None, help="Optional custom OpenAI-compatible base URL for OpenClaw.")
     parser.add_argument("--openclaw-api-key", default=None, help="Optional API key for the OpenClaw provider.")
     args = parser.parse_args()
 
-    model_id = args.model or args.judge or f"google/{args.api_model}"
+    api_provider = args.api_provider
+    if api_provider is None:
+        api_provider = (
+            "openrouter"
+            if os.getenv("OPENROUTER_API_KEY") and not os.getenv("GEMINI_API_KEY")
+            else "gemini"
+        )
+    api_model = args.api_model or (
+        "google/gemini-3.1-pro-preview"
+        if api_provider == "openrouter"
+        else "gemini-3-pro-preview"
+    )
+    fallback_model = api_model
+    if api_provider == "gemini" and not fallback_model.startswith(("google/", "gemini/")):
+        fallback_model = f"google/{fallback_model}"
+    fallback_model = fallback_model.removeprefix("openrouter/")
+    model_id = (args.model or args.judge or fallback_model).removeprefix(
+        "openrouter/"
+    )
 
     runner = OpenClawPinchBenchExpel(
         model_id=model_id,
@@ -1400,7 +1733,9 @@ def main() -> None:
         pinchbench_dir=args.pinchbench_dir,
         judge_model=args.judge,
         api_key=args.api_key,
-        api_model=args.api_model,
+        api_provider=api_provider,
+        api_model=api_model,
+        rag_embedding_model=args.rag_embedding_model,
         thinking_level=args.thinking_level,
         max_reflection_depth=args.max_reflection_depth,
         max_rules=args.max_rules,

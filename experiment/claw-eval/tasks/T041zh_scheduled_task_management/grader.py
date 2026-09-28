@@ -1,4 +1,4 @@
-"""T21_scheduled_task_management grader — cron job audit and remediation."""
+"""T041zh_scheduled_task_management grader — cron job audit and remediation."""
 
 from __future__ import annotations
 
@@ -33,6 +33,11 @@ class ScheduledTaskManagementGrader(AbstractGrader):
     KB_DISK = "KB-502"
     KB_CERT = "KB-503"
 
+    # Health report keywords (overrideable by EN variant)
+    REPORT_KEYWORDS = ["健康", "正常", "失败", "禁用", "异常", "建议"]
+
+    # Stale job keywords (overrideable by EN variant)
+    STALE_KEYWORDS = ["临时", "temporary", "30天", "30日", "过期", "stale", "清理", "删除评估"]
 
     OPS_EMAIL = "ops@company.com"
 
@@ -114,7 +119,7 @@ class ScheduledTaskManagementGrader(AbstractGrader):
         stale_score = 0.0
         if self.STALE_JOB in all_text:
             stale_keywords = any(
-                kw in all_text for kw in ["临时", "temporary", "30天", "30日", "过期", "stale", "清理", "删除评估"]
+                kw in all_text for kw in self.STALE_KEYWORDS
             )
             if stale_keywords:
                 stale_score = 1.0
@@ -172,7 +177,7 @@ class ScheduledTaskManagementGrader(AbstractGrader):
         if has_structure:
             report_score += 0.3
 
-        report_keywords = sum(1 for kw in ["健康", "正常", "失败", "禁用", "异常", "建议"] if kw in final_text)
+        report_keywords = sum(1 for kw in self.REPORT_KEYWORDS if kw in final_text)
         if report_keywords >= 3:
             report_score += 0.2
         elif report_keywords >= 1:

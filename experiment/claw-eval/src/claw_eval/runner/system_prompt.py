@@ -165,8 +165,13 @@ def build_system_prompt(
 
     blocks: list[str] = [
         "You are a personal assistant running inside OpenClaw.",
-        _render_tool_definitions(task, extra_tools),
     ]
+
+    # Inject current date if mock_today is set
+    if task.environment.mock_today:
+        blocks.append(f"Current date: {task.environment.mock_today}")
+
+    blocks.append(_render_tool_definitions(task, extra_tools))
     if prompt_cfg.include_tool_schema:
         blocks.append(_render_tool_schemas(task, extra_tools))
     blocks.append(_render_behavior_rules(prompt_cfg))

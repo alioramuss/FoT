@@ -1,4 +1,4 @@
-"""T05en_contact_lookup grader — English variant."""
+"""T010_contact_lookupen_contact_lookup grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

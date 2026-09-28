@@ -23,7 +23,7 @@ from claw_eval.models.trace import DimensionScores, MediaLoad, ToolDispatch, Tra
 
 
 MEME_PATH = "/workspace/meme.png"
-GT_IMAGE_PATH = "/workspace/fixtures/gt.png"
+GT_LOCAL_FILE = "fixtures/gt.png"
 
 FACE_MATCH_RUBRIC = """\
 You are comparing two images from a movie clip.
@@ -103,7 +103,7 @@ class Grader(AbstractGrader, MultimodalGraderMixin, VisualGraderMixin):
         )
 
         # Get GT image base64
-        gt_entry = snapshot.get(f"file:{GT_IMAGE_PATH}", {})
+        gt_entry = snapshot.get(f"local_file:{GT_LOCAL_FILE}", {})
         gt_b64 = (
             gt_entry.get("content", "")
             if gt_entry.get("encoding") == "base64"

@@ -1,4 +1,4 @@
-"""T52_officeqa_max_yield_spread grader — maximum yield spread 1960-1969."""
+"""T078_officeqa_max_yield_spread grader — maximum yield spread 1960-1969."""
 
 from __future__ import annotations
 

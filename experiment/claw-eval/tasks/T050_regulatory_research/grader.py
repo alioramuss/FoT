@@ -1,4 +1,4 @@
-"""T25en_regulatory_research grader — English variant."""
+"""T050_regulatory_researchen_regulatory_research grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 
