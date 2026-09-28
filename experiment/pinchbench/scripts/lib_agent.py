@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error, request
 
-from lib_tasks import Task
+from lib_tasks import Task, pinchbench_tmp_root
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
 
 
@@ -486,7 +486,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     if workspace is None:
         # Fallback to task-specific workspace if agent workspace not found
         logger.warning("Could not find agent workspace, using fallback")
-        workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
+        workspace = pinchbench_tmp_root() / run_id / task.task_id
 
     _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
 
@@ -1250,10 +1250,14 @@ def call_judge_api(
     prompt: str,
     model: str,
     timeout_seconds: float = 120.0,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Call a judge model directly via API, bypassing OpenClaw.
 
-    Dispatches based on model prefix:
+    When ``provider`` is supplied it is authoritative, so an OpenRouter-hosted
+    ``google/...`` model is not accidentally routed to the native Gemini API.
+    Without an explicit provider, dispatch falls back to the model prefix:
       - openrouter/* -> OpenRouter chat completions API
       - anthropic/*  -> Anthropic Messages API
       - openai/*     -> OpenAI chat completions API
@@ -1261,16 +1265,32 @@ def call_judge_api(
 
     Returns {"status": str, "text": str, "error"?: str}.
     """
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider == "openrouter":
+        return _judge_via_openrouter(prompt, model, timeout_seconds, api_key=api_key)
+    if normalized_provider == "gemini":
+        return _judge_via_gemini(prompt, model, timeout_seconds, api_key=api_key)
+    if normalized_provider == "openai":
+        return _judge_via_openai(prompt, model, timeout_seconds, api_key=api_key)
+    if normalized_provider == "anthropic":
+        return _judge_via_anthropic(prompt, model, timeout_seconds, api_key=api_key)
+    if normalized_provider not in {"", "auto"}:
+        return {
+            "status": "error",
+            "text": "",
+            "error": f"Unsupported judge provider: {provider}",
+        }
+
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
     if model.startswith("anthropic/"):
-        return _judge_via_anthropic(prompt, model, timeout_seconds)
+        return _judge_via_anthropic(prompt, model, timeout_seconds, api_key=api_key)
     if model.startswith("openai/"):
-        return _judge_via_openai(prompt, model, timeout_seconds)
+        return _judge_via_openai(prompt, model, timeout_seconds, api_key=api_key)
     if model.startswith("google/"):
-        return _judge_via_gemini(prompt, model, timeout_seconds)
+        return _judge_via_gemini(prompt, model, timeout_seconds, api_key=api_key)
     # Default: OpenRouter (handles openrouter/ prefix and bare provider/model)
-    return _judge_via_openrouter(prompt, model, timeout_seconds)
+    return _judge_via_openrouter(prompt, model, timeout_seconds, api_key=api_key)
 
 
 def _judge_via_openai_compat(
@@ -1280,9 +1300,10 @@ def _judge_via_openai_compat(
     api_key: str,
     timeout_seconds: float,
     extra_headers: Optional[Dict[str, str]] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared implementation for OpenAI-compatible chat completions APIs."""
-    payload = json.dumps({
+    request_payload: Dict[str, Any] = {
         "model": api_model,
         "messages": [
             {"role": "system", "content": _JUDGE_SYSTEM_MSG},
@@ -1290,7 +1311,12 @@ def _judge_via_openai_compat(
         ],
         "temperature": 0.0,
         "max_completion_tokens": 2048,
-    }).encode("utf-8")
+    }
+    if extra_payload:
+        request_payload.update(extra_payload)
+        if "max_tokens" in extra_payload:
+            request_payload.pop("max_completion_tokens", None)
+    payload = json.dumps(request_payload).encode("utf-8")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1320,12 +1346,79 @@ def _judge_via_openai_compat(
     choices = data.get("choices", [])
     if not choices:
         return {"status": "error", "text": "", "error": "No choices in response"}
-    text = choices[0].get("message", {}).get("content", "")
-    return {"status": "success", "text": text}
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\n".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("text")
+        )
+    else:
+        text = ""
+
+    # OpenRouter reasoning models may put text in reasoning fields. This is a
+    # fallback only when final content is empty; the grading parser still
+    # requires a valid judge JSON object before accepting it.
+    reasoning_text = ""
+    if not text.strip():
+        reasoning_parts: List[str] = []
+        for key in ("reasoning", "reasoning_content"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                reasoning_parts.append(value)
+        details = message.get("reasoning_details") or []
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                value = detail.get("text") or detail.get("summary")
+                if isinstance(value, str) and value.strip():
+                    reasoning_parts.append(value)
+        reasoning_text = "\n".join(reasoning_parts).strip()
+        # Do not scrape arbitrary JSON examples out of chain-of-thought. Only
+        # accept the reasoning fallback when the entire field is itself the
+        # requested judge object.
+        if reasoning_text:
+            try:
+                reasoning_json = json.loads(reasoning_text)
+            except json.JSONDecodeError:
+                reasoning_json = None
+            if isinstance(reasoning_json, dict) and any(
+                key in reasoning_json
+                for key in ("scores", "total", "score", "overall_score")
+            ):
+                text = reasoning_text
+
+    if not text.strip():
+        usage = data.get("usage") or {}
+        return {
+            "status": "error",
+            "text": "",
+            "error": (
+                "Judge returned empty content "
+                f"(finish_reason={choice.get('finish_reason')!r}, "
+                f"reasoning_chars={len(reasoning_text)}, usage={usage})"
+            ),
+        }
+    return {
+        "status": "success",
+        "text": text,
+        "finish_reason": choice.get("finish_reason"),
+        "usage": data.get("usage") or {},
+    }
 
 
-def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+def _judge_via_openrouter(
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         return {"status": "error", "text": "", "error": "OPENROUTER_API_KEY not set"}
     bare_model = model.removeprefix("openrouter/")
@@ -1334,11 +1427,22 @@ def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Di
         "https://openrouter.ai/api/v1/chat/completions",
         api_key, timeout_seconds,
         extra_headers={"HTTP-Referer": "https://pinchbench.com", "X-Title": "PinchBench-Judge"},
+        extra_payload={
+            # DeepSeek V4 Flash can spend most of a short completion on
+            # reasoning. Leave enough room for its final grading JSON.
+            "max_tokens": 8192,
+            "response_format": {"type": "json_object"},
+        },
     )
 
 
-def _judge_via_openai(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
-    api_key = os.environ.get("OPENAI_API_KEY")
+def _judge_via_openai(
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    api_key = api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return {"status": "error", "text": "", "error": "OPENAI_API_KEY not set"}
     bare_model = model.removeprefix("openai/")
@@ -1349,8 +1453,13 @@ def _judge_via_openai(prompt: str, model: str, timeout_seconds: float) -> Dict[s
     )
 
 
-def _judge_via_gemini(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
-    api_key = os.environ.get("GEMINI_API_KEY")
+def _judge_via_gemini(
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {"status": "error", "text": "", "error": "GEMINI_API_KEY not set"}
     bare_model = model.removeprefix("google/")
@@ -1361,8 +1470,13 @@ def _judge_via_gemini(prompt: str, model: str, timeout_seconds: float) -> Dict[s
     )
 
 
-def _judge_via_anthropic(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+def _judge_via_anthropic(
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return {"status": "error", "text": "", "error": "ANTHROPIC_API_KEY not set"}
     bare_model = model.removeprefix("anthropic/")

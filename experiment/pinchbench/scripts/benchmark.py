@@ -47,7 +47,7 @@ from lib_grading import (
     get_judge_cache_stats,
     clear_judge_cache,
 )
-from lib_tasks import Task, TaskLoader
+from lib_tasks import Task, TaskLoader, pinchbench_tmp_root
 
 
 # Configure logging
@@ -795,12 +795,12 @@ def main():
     runner.load_tasks()
 
     model_slug = slugify_model(args.model)
-    run_root = Path("/tmp/pinchbench")
+    run_root = pinchbench_tmp_root()
     run_id = _next_run_id(run_root)
     skill_dir = skill_root
     agent_id = f"bench-{model_slug}"
     # Use a shared workspace for the agent - we'll copy fixtures per task
-    agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace")
+    agent_workspace = run_root / run_id / "agent_workspace"
 
     # Validate model exists before wasting time on tasks
     if args.base_url:
