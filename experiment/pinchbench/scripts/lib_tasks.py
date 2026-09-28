@@ -7,6 +7,7 @@ benchmarking system.
 
 import logging
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -14,6 +15,16 @@ import yaml
 
 
 logger = logging.getLogger(__name__)
+
+
+def pinchbench_tmp_root() -> Path:
+    """Root scratch directory for task/agent/judge workspaces.
+
+    Honors $TMPDIR/$TEMP/$TMP (via tempfile.gettempdir()) instead of
+    hardcoding /tmp, so a SLURM job can redirect scratch space to a
+    larger filesystem by exporting TMPDIR before launching the pipeline.
+    """
+    return Path(tempfile.gettempdir()) / "pinchbench"
 
 
 class Task:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lib_agent import call_judge_api, ensure_agent_exists, run_openclaw_prompt, slugify_model
-from lib_tasks import Task
+from lib_tasks import Task, pinchbench_tmp_root
 
 
 logger = logging.getLogger(__name__)
@@ -65,9 +65,15 @@ def _save_judge_cache() -> None:
         logger.warning(f"Failed to save judge cache: {e}")
 
 
-def _compute_cache_key(task_id: str, transcript: str, rubric: str, model: str) -> str:
+def _compute_cache_key(
+    task_id: str,
+    transcript: str,
+    rubric: str,
+    model: str,
+    provider: Optional[str] = None,
+) -> str:
     """Compute a cache key from grading inputs."""
-    content = f"{task_id}|{transcript}|{rubric}|{model}"
+    content = f"{task_id}|{transcript}|{rubric}|{provider or 'auto'}|{model}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -120,6 +126,8 @@ def grade_task(
     judge_agent_prefix: str = DEFAULT_JUDGE_AGENT_PREFIX,
     judge_timeout_seconds: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
     judge_backend: str = "api",
+    judge_provider: Optional[str] = None,
+    judge_api_key: Optional[str] = None,
     verbose: bool = False,
 ) -> GradeResult:
     grading_type = task.grading_type
@@ -140,6 +148,8 @@ def grade_task(
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
+            judge_provider=judge_provider,
+            judge_api_key=judge_api_key,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -155,6 +165,8 @@ def grade_task(
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
+            judge_provider=judge_provider,
+            judge_api_key=judge_api_key,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -170,26 +182,16 @@ def _grade_automated(
 ) -> GradeResult:
     grading_code = _extract_grading_code(task)
     if not grading_code:
-        return GradeResult(
-            task_id=task.task_id,
-            score=0.0,
-            max_score=1.0,
-            grading_type="automated",
-            breakdown={},
-            notes="No automated grading code found",
+        raise RuntimeError(
+            f"Automated grader is missing grading code for {task.task_id}"
         )
 
     namespace = _build_automated_namespace(skill_dir)
     exec(grading_code, namespace)
     grade_func = namespace.get("grade")
     if not callable(grade_func):
-        return GradeResult(
-            task_id=task.task_id,
-            score=0.0,
-            max_score=1.0,
-            grading_type="automated",
-            breakdown={},
-            notes="Automated grading function missing",
+        raise RuntimeError(
+            f"Automated grader has no callable grade() for {task.task_id}"
         )
 
     scores = grade_func(
@@ -214,9 +216,10 @@ def _grade_automated(
 
 
 _PRIVATE_IMAGE_KEY_FILENAME = "image_classification_answer_key.json"
-_PRIVATE_IMAGE_KEY_RUNTIME_PATH = (
-    Path("/tmp/pinchbench/judge/private") / _PRIVATE_IMAGE_KEY_FILENAME
-)
+
+
+def _private_image_key_runtime_path() -> Path:
+    return pinchbench_tmp_root() / "judge" / "private" / _PRIVATE_IMAGE_KEY_FILENAME
 
 
 def _build_automated_namespace(skill_dir: Optional[Path]) -> Dict[str, Any]:
@@ -235,10 +238,11 @@ def _stage_private_image_key(skill_dir: Optional[Path]) -> str:
         return ""
 
     try:
-        _PRIVATE_IMAGE_KEY_RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PRIVATE_IMAGE_KEY_RUNTIME_PATH.write_bytes(source_key_path.read_bytes())
-        os.chmod(_PRIVATE_IMAGE_KEY_RUNTIME_PATH, 0o600)
-        return str(_PRIVATE_IMAGE_KEY_RUNTIME_PATH)
+        runtime_path = _private_image_key_runtime_path()
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_bytes(source_key_path.read_bytes())
+        os.chmod(runtime_path, 0o600)
+        return str(runtime_path)
     except OSError as exc:
         logger.warning("Failed to stage private image answer key: %s", exc)
         return ""
@@ -252,25 +256,17 @@ def _grade_llm_judge(
     judge_agent_prefix: str,
     judge_timeout_seconds: float,
     judge_backend: str = "api",
+    judge_provider: Optional[str] = None,
+    judge_api_key: Optional[str] = None,
     skill_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> GradeResult:
     transcript = execution_result.get("transcript", [])
     execution_status = execution_result.get("status", "unknown")
 
-    if not transcript and execution_status != "success":
-        if verbose:
-            logger.info(
-                "   [VERBOSE] Skipping LLM judge: status=%s, transcript empty",
-                execution_status,
-            )
-        return GradeResult(
-            task_id=task.task_id,
-            score=0.0,
-            max_score=1.0,
-            grading_type="llm_judge",
-            breakdown={},
-            notes=f"Skipped: task execution failed ({execution_status}), no transcript to evaluate",
+    if not transcript:
+        raise RuntimeError(
+            f"Cannot judge {task.task_id}: empty transcript (status={execution_status})"
         )
 
     transcript_summary = _summarize_transcript(transcript)
@@ -288,7 +284,9 @@ def _grade_llm_judge(
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
     
     # Check cache before calling judge
-    cache_key = _compute_cache_key(task.task_id, transcript_summary, rubric, judge_model)
+    cache_key = _compute_cache_key(
+        task.task_id, transcript_summary, rubric, judge_model, judge_provider
+    )
     if cache_key in _judge_cache:
         cached = _judge_cache[cache_key]
         if verbose:
@@ -310,6 +308,7 @@ def _grade_llm_judge(
 
     max_judge_attempts = 2
     raw_parsed: Dict[str, Any] = {}
+    judge_failures: List[str] = []
     for attempt in range(max_judge_attempts):
         if judge_backend == "api":
             # Direct API call — bypasses OpenClaw personality injection
@@ -317,6 +316,8 @@ def _grade_llm_judge(
                 prompt=prompt,
                 model=judge_model,
                 timeout_seconds=judge_timeout_seconds,
+                provider=judge_provider,
+                api_key=judge_api_key,
             )
 
             if verbose:
@@ -325,6 +326,10 @@ def _grade_llm_judge(
                     logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
 
             if judge_result.get("status") != "success":
+                failure = str(
+                    judge_result.get("error", judge_result.get("status", "unknown error"))
+                )
+                judge_failures.append(failure)
                 logger.warning(
                     "Judge API call failed (attempt %d/%d): %s",
                     attempt + 1,
@@ -333,14 +338,14 @@ def _grade_llm_judge(
                 )
                 if attempt < max_judge_attempts - 1:
                     time.sleep(2**attempt)
-                    continue
+                continue
 
             raw_parsed = _parse_judge_text(judge_result.get("text", ""))
         else:
             # Default: OpenClaw agent session
             judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
             agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, judge_skill_dir)
-            judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
+            judge_workspace = pinchbench_tmp_root() / "judge" / task.task_id
             judge_result = run_openclaw_prompt(
                 agent_id=agent_id,
                 prompt=prompt,
@@ -366,7 +371,15 @@ def _grade_llm_judge(
 
             raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
 
-        break  # Parsed response; exit loop after success or after the final failed attempt
+        if _looks_like_judge_payload(raw_parsed):
+            break
+        text_preview = str(judge_result.get("text", "")).strip()[:200]
+        judge_failures.append(
+            "unparseable judge response"
+            + (f": {text_preview}" if text_preview else " (empty text)")
+        )
+        if attempt < max_judge_attempts - 1:
+            time.sleep(2**attempt)
 
     if verbose:
         logger.info("   [VERBOSE] Judge raw response parsed: %s", raw_parsed)
@@ -381,19 +394,28 @@ def _grade_llm_judge(
     notes = parsed.get("notes", "")
 
     if not raw_parsed:
-        notes = "LLM judge failed: no parseable response after all attempts"
-        logger.warning("LLM judge for %s produced no parseable output", task.task_id)
-    elif total is None:
-        notes = "LLM judge failed: response parsed but no score extracted"
-        logger.warning(
-            "LLM judge for %s: parsed response but no total score found: %s",
-            task.task_id,
-            raw_parsed,
+        detail = judge_failures[-1] if judge_failures else "unknown judge failure"
+        raise RuntimeError(
+            f"LLM judge failed for {task.task_id} after all attempts: {detail}"
+        )
+    if total is None:
+        raise RuntimeError(
+            f"LLM judge returned no score for {task.task_id}: {raw_parsed}"
+        )
+    try:
+        numeric_total = float(total)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"LLM judge returned a non-numeric score for {task.task_id}: {total!r}"
+        ) from exc
+    if not 0.0 <= numeric_total <= 1.0:
+        raise RuntimeError(
+            f"LLM judge returned an out-of-range score for {task.task_id}: {numeric_total}"
         )
     
     result = GradeResult(
         task_id=task.task_id,
-        score=float(total) if total is not None else 0.0,
+        score=numeric_total,
         max_score=1.0,
         grading_type="llm_judge",
         breakdown=_normalize_score_dict(breakdown),
@@ -578,7 +600,7 @@ def _build_judge_prompt(
 def _ensure_judge_agent(judge_agent_prefix: str, judge_model: str, skill_dir: Path) -> str:
     model_slug = slugify_model(judge_model)
     agent_id = f"{judge_agent_prefix}-{model_slug}"
-    workspace = Path("/tmp/pinchbench/judge/workspace")
+    workspace = pinchbench_tmp_root() / "judge" / "workspace"
     ensure_agent_exists(agent_id, judge_model, workspace)
     return agent_id
 
@@ -739,6 +761,44 @@ def _parse_judge_text(raw_text: str) -> Dict[str, Any]:
             return parsed
     except json.JSONDecodeError:
         pass
+
+    # Some OpenRouter models occasionally wrap an otherwise valid object as
+    # {"{"scores": {...}}. Recover only a nested object that starts with a
+    # recognized judge key; do not accept arbitrary embedded JSON.
+    nested_judge_start = re.compile(
+        r'\{\s*"(?:scores|criteria_scores|criterion_scores|total|score|overall_score)"\s*:'
+    )
+    for match in nested_judge_start.finditer(raw_text):
+        start = match.start()
+        depth = 0
+        in_string = False
+        escape_next = False
+        for index in range(start, len(raw_text)):
+            char = raw_text[index]
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\" and in_string:
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(raw_text[start : index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if _looks_like_judge_payload(parsed):
+                        logger.warning("Repaired malformed wrapper around judge JSON")
+                        return parsed
+                    break
 
     # Try extracting from code blocks
     code_block_match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_text, re.DOTALL)
