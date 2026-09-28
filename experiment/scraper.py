@@ -12,14 +12,21 @@ import os
 import re
 import time
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 
 class OpenReviewScraper:
-    def __init__(self, output_dir="data/papers/iclr23_top5", year=2023):
+    def __init__(
+        self,
+        output_dir="data/papers/iclr23_top5",
+        year=2023,
+        username=None,
+        password=None,
+        token=None,
+    ):
         self.output_dir = output_dir
         self.year = year
         self.base_url = "https://openreview.net"
@@ -29,9 +36,144 @@ class OpenReviewScraper:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
         )
+        self.public_session = requests.Session()
+        self.public_session.headers.update(self.session.headers)
+        self.openreview_auth_failed = False
+        self._configure_openreview_auth(
+            username=username or os.getenv("OPENREVIEW_USERNAME"),
+            password=password or os.getenv("OPENREVIEW_PASSWORD"),
+            token=token or os.getenv("OPENREVIEW_TOKEN"),
+        )
 
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+
+    def _configure_openreview_auth(self, username=None, password=None, token=None):
+        """Authenticate the requests session against OpenReview API v2.
+
+        OpenReview's cluster-facing endpoints can reject guest traffic with
+        HTTP 403. A v2 login returns a bearer token that is accepted by the API
+        and PDF endpoints used throughout this scraper. Environment variables
+        are preferred so credentials never need to appear in process arguments.
+        """
+        if token:
+            clean_token = str(token).removeprefix("Bearer ").strip()
+            if not clean_token:
+                raise ValueError("OPENREVIEW_TOKEN is empty")
+            self.session.headers["Authorization"] = f"Bearer {clean_token}"
+            print("Using OpenReview bearer-token authentication.")
+            return
+
+        if bool(username) != bool(password):
+            raise ValueError(
+                "Set both OPENREVIEW_USERNAME and OPENREVIEW_PASSWORD, or neither."
+            )
+        if not username:
+            print(
+                "OpenReview credentials are not set; attempting public guest access."
+            )
+            return
+
+        login_response = self.session.post(
+            "https://api2.openreview.net/login",
+            json={"id": username, "password": password},
+            timeout=60,
+        )
+        if login_response.status_code != 200:
+            self.openreview_auth_failed = True
+            error_message = ""
+            try:
+                error_data = login_response.json()
+                error_message = str(
+                    error_data.get("message")
+                    or error_data.get("name")
+                    or ""
+                ).strip()
+            except Exception:
+                pass
+            detail = f" ({error_message})" if error_message else ""
+            print(
+                "Warning: OpenReview authentication failed with HTTP "
+                f"{login_response.status_code}{detail}. The scraper will use "
+                "the official ICLR proceedings fallback when possible."
+            )
+            return
+        login_data = login_response.json()
+        clean_token = str(login_data.get("token") or "").removeprefix("Bearer ").strip()
+        if not clean_token:
+            if login_data.get("mfaPending"):
+                raise RuntimeError(
+                    "OpenReview requires MFA for this login. Authenticate with "
+                    "openreview-py and export its token as OPENREVIEW_TOKEN."
+                )
+            raise RuntimeError("OpenReview login succeeded but returned no token")
+        self.session.headers["Authorization"] = f"Bearer {clean_token}"
+        print("Authenticated with OpenReview API v2.")
+
+    def _fetch_all_accepted_from_proceedings(self):
+        """Fetch all accepted papers from the official ICLR proceedings.
+
+        The proceedings page does not distinguish oral, spotlight, and poster,
+        so this fallback is used only when the caller requests all three
+        accepted tracks together.
+        """
+        index_url = (
+            f"https://proceedings.iclr.cc/paper_files/paper/{self.year}"
+        )
+        print(
+            "Fetching all accepted papers from official ICLR proceedings: "
+            f"{index_url}"
+        )
+        try:
+            response = self.public_session.get(index_url, timeout=120)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, "html.parser")
+            link_pattern = re.compile(
+                rf"/paper_files/paper/{self.year}/hash/"
+                r"([0-9a-f]+)-Abstract-Conference\.html$",
+                re.IGNORECASE,
+            )
+            papers = []
+            seen_ids = set()
+            for anchor in soup.find_all("a", href=True):
+                match = link_pattern.search(anchor["href"])
+                if not match:
+                    continue
+                paper_id = match.group(1).lower()
+                if paper_id in seen_ids:
+                    continue
+                title = anchor.get_text(" ", strip=True)
+                if not title:
+                    continue
+                seen_ids.add(paper_id)
+                abstract_url = urljoin(index_url, anchor["href"])
+                pdf_url = (
+                    "https://proceedings.iclr.cc/paper_files/paper/"
+                    f"{self.year}/file/{paper_id}-Paper-Conference.pdf"
+                )
+                papers.append(
+                    {
+                        "id": paper_id,
+                        "forum": paper_id,
+                        "title": title,
+                        "track": "conference",
+                        "url": abstract_url,
+                        "pdf_url": pdf_url,
+                        "content": {
+                            "title": title,
+                            "venue": f"ICLR {self.year} Conference",
+                            "venueid": f"ICLR.cc/{self.year}/Conference",
+                        },
+                    }
+                )
+            print(
+                f"Found {len(papers)} accepted ICLR {self.year} papers in "
+                "the official proceedings."
+            )
+            return papers
+        except Exception as exc:
+            print(f"Official ICLR proceedings fetch failed: {exc}")
+            return []
 
     def _search_papers_by_title(self, title_filter):
         """
@@ -437,6 +579,14 @@ class OpenReviewScraper:
         """
         # If using accepted tabs, go straight to web scraping (API invitation differs)
         if accept_oral or accept_spotlight or accept_poster:
+            all_accept_tracks = (
+                accept_oral and accept_spotlight and accept_poster
+            )
+            if self.openreview_auth_failed and all_accept_tracks:
+                papers = self._fetch_all_accepted_from_proceedings()
+                if papers:
+                    return papers
+
             # Try API via Decision notes first (most reliable)
             papers_api = self._fetch_accept_tracks_via_decisions(
                 accept_oral=accept_oral,
@@ -463,6 +613,10 @@ class OpenReviewScraper:
             )
             if papers_api:
                 return papers_api
+            if all_accept_tracks:
+                papers = self._fetch_all_accepted_from_proceedings()
+                if papers:
+                    return papers
             return self._scrape_web_page(
                 title_filter=title_filter,
                 top5=top5,
@@ -810,6 +964,7 @@ class OpenReviewScraper:
 
     def download_paper(self, paper_info):
         """Download a paper PDF given paper information"""
+        self._last_download_was_cached = False
         # Try to get paper ID from various possible fields
         # The forum ID is what's used in OpenReview URLs
         paper_id = (
@@ -836,15 +991,38 @@ class OpenReviewScraper:
         safe_title = re.sub(r"[^\w\s-]", "", title)[:100]
         safe_title = re.sub(r"[-\s]+", "-", safe_title)
 
-        # Use the standard OpenReview PDF URL format: https://openreview.net/pdf?id={paper_id}
-        # This is the most reliable method as shown in the example: https://openreview.net/pdf?id=4-k7kUavAj
-        pdf_url = f"https://openreview.net/pdf?id={paper_id}"
+        # Prefer an explicit PDF URL (for example, the official ICLR
+        # proceedings fallback); otherwise use the standard OpenReview route.
+        pdf_url = paper_info.get("pdf_url") or paper_info.get("pdf")
+        if isinstance(pdf_url, dict):
+            pdf_url = pdf_url.get("value")
+        if not pdf_url:
+            pdf_url = f"https://openreview.net/pdf?id={paper_id}"
 
         # Download PDF
         pdf_path = os.path.join(self.output_dir, f"{safe_title}_{paper_id}.pdf")
 
+        # Resume safely: reuse only files that have a PDF signature. Partial or
+        # invalid files are downloaded again to the same deterministic path.
+        if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 4:
+            try:
+                with open(pdf_path, "rb") as existing_pdf:
+                    if existing_pdf.read(5) == b"%PDF-":
+                        self._last_download_was_cached = True
+                        print(f"Already downloaded, reusing: {title}")
+                        return pdf_path
+            except OSError:
+                pass
+
         try:
-            response = self.session.get(pdf_url, timeout=60, stream=True)
+            hostname = (urlparse(pdf_url).hostname or "").lower()
+            download_session = (
+                self.session
+                if hostname == "openreview.net"
+                or hostname.endswith(".openreview.net")
+                else self.public_session
+            )
+            response = download_session.get(pdf_url, timeout=60, stream=True)
             response.raise_for_status()
 
             # Check if response is actually a PDF
@@ -903,7 +1081,7 @@ class OpenReviewScraper:
         }
 
         try:
-            response = self.session.get(base_url, params=params, timeout=30)
+            response = self.public_session.get(base_url, params=params, timeout=30)
             response.raise_for_status()
             xml_text = response.text
 
@@ -1007,8 +1185,10 @@ class OpenReviewScraper:
             )
 
         if not papers:
-            print("No papers found. Please check the URL or API access.")
-            return
+            raise RuntimeError(
+                "No papers found. OpenReview API access failed or the selected "
+                "venue tracks are empty."
+            )
 
         total_papers = len(papers)
         print(f"Found {total_papers} papers")
@@ -1029,7 +1209,8 @@ class OpenReviewScraper:
             result = self.download_paper(paper)
             if result:
                 downloaded += 1
-            time.sleep(1)  # Be respectful with rate limiting
+            if not self._last_download_was_cached:
+                time.sleep(1)  # Be respectful with rate limiting
 
         print(
             f"\nCompleted! Downloaded {downloaded}/{len(papers)} papers to {self.output_dir}"

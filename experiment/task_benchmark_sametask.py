@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+import parallel_utils
 
 from server import InsightAggregationServer
 from server_text import TextBasedInsightAggregationServer
@@ -28,7 +29,7 @@ from task_benchmark_domain import (
     _CLIENT_CHOICES,
     _parse_list_arg,
 )
-from utils import setup_gemini
+from utils import normalize_api_model, setup_gemini
 
 
 def _slugify_model_name(model_name: str) -> str:
@@ -56,6 +57,7 @@ class SameTaskBenchmarkPipeline(BenchmarkDomainPipeline):
     def _configure_client_for_agent(self, agent_model: str) -> None:
         """Make the inherited client use this agent model."""
         self.model_name = agent_model
+        self.api_model = normalize_api_model(self.api_provider, agent_model)
         self.client = None
         self._ensure_client()
 
@@ -277,6 +279,7 @@ def main():
             "all model traces into one encyclopedia."
         )
     )
+    parallel_utils.add_num_workers_argument(parser)
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -419,6 +422,7 @@ def main():
         num_iterations=args.num_iterations,
         load_in_8bit=args.load_in_8bit,
         client_type=args.client,
+        num_workers=args.num_workers,
     )
 
     try:

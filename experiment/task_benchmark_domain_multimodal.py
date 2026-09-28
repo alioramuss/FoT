@@ -14,6 +14,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
+import parallel_utils
 
 from hle_datasets.hle import (
     HLE_DATASET_ID,
@@ -379,6 +380,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Iterative benchmark learning pipeline: solve (if encyclopedia available) + extract insights + aggregate → repeat"
     )
+    parallel_utils.add_num_workers_argument(parser)
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -424,6 +426,12 @@ def main():
     )
     parser.add_argument(
         "--api-key", type=str, default=None, help="API key for the chosen provider.",
+    )
+    parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help="Provider model name, e.g. google/gemini-2.5-flash-lite on OpenRouter.",
     )
     parser.add_argument(
         "--load-in-8bit",
@@ -485,9 +493,11 @@ def main():
         use_api=args.use_api,
         api_key=args.api_key,
         api_provider=args.api_provider,
+        api_model=args.api_model,
         mode=args.mode,
         num_iterations=args.num_iterations,
         load_in_8bit=args.load_in_8bit,
+        num_workers=args.num_workers,
     )
 
     try:

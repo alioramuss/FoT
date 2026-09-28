@@ -25,6 +25,8 @@ from utils import (
     setup_gemini,
     call_gemini,
     call_openrouter,
+    normalize_api_model,
+    resolve_api_key,
     load_hf_model,
     call_hf_model,
 )
@@ -56,6 +58,7 @@ class InsightAggregationServer:
         use_api: bool = False,
         api_key: Optional[str] = None,
         api_provider: str = "gemini",
+        api_model: Optional[str] = None,
     ):
         self.model_name = model_name
         self.input_dir = input_dir
@@ -67,13 +70,18 @@ class InsightAggregationServer:
 
         # API support
         self.use_api = use_api
-        self.api_provider = api_provider
-        self.api_key = api_key or (os.getenv("GEMINI_API_KEY") if api_provider == "gemini" else os.getenv("OPENROUTER_API_KEY"))
-        self.api_model_name = None  # set externally if needed
+        self.api_provider = api_provider.strip().lower()
+        self.api_key = resolve_api_key(self.api_provider, api_key)
+        default_model = (
+            "gemini-3-pro-preview" if self.api_provider == "gemini" else None
+        )
+        self.api_model_name = normalize_api_model(
+            self.api_provider, api_model or default_model
+        )
         if self.use_api and self.api_provider == "gemini":
             self.gemini_model = setup_gemini(
                 api_key=self.api_key,
-                model_name="gemini-3-pro-preview",
+                model_name=self.api_model_name,
             )
 
         # Model and tokenizer will be loaded lazily on first use (only for HuggingFace models)
@@ -102,8 +110,9 @@ class InsightAggregationServer:
         """
         if self.use_api:
             if self.api_provider == "openrouter":
-                model = getattr(self, "api_model_name", None) or "anthropic/claude-opus-4.6"
-                text, _ = call_openrouter(self.api_key, model, prompt, system_prompt)
+                text, _ = call_openrouter(
+                    self.api_key, self.api_model_name, prompt, system_prompt
+                )
             else:
                 text, _ = call_gemini(self.gemini_model, prompt, system_prompt)
             return text
@@ -974,6 +983,12 @@ if __name__ == "__main__":
         default=None,
         help="API key for the chosen provider (or set GEMINI_API_KEY / OPENROUTER_API_KEY env var)",
     )
+    parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help="Provider model name, e.g. google/gemini-2.5-flash-lite on OpenRouter.",
+    )
 
     args = parser.parse_args()
 
@@ -985,6 +1000,7 @@ if __name__ == "__main__":
         use_api=args.use_api,
         api_key=args.api_key,
         api_provider=args.api_provider,
+        api_model=args.api_model,
     )
 
     try:

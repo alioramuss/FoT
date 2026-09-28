@@ -8,7 +8,7 @@ Step 2: Domain-specific guided summarization following Claude Cookbooks:
         - Chunk the insights into manageable pieces
         - Summarize each chunk individually
         - Consolidate chunk summaries into a final compacted summary
-Output: encyclopedia.json with {"insight": <compacted_summary>}
+Output: encyclopedia.json with {"insight_summary": <compacted_summary>}
 
 Reference: https://github.com/anthropics/claude-cookbooks/tree/main/capabilities/summarization
 """
@@ -19,7 +19,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from utils import setup_gemini, call_gemini
 
@@ -210,11 +210,39 @@ def chunk_text(text: str, chunk_size: int = 50000) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
+def clean_summary_response(response_text: str) -> str:
+    """Normalize Gemini and DeepSeek summary response wrappers."""
+    if not isinstance(response_text, str):
+        return ""
+    cleaned = re.sub(
+        r"<think\b[^>]*>.*?</think>",
+        "",
+        response_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    summary_match = re.search(
+        r"<summary\b[^>]*>(.*?)</summary>",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if summary_match:
+        cleaned = summary_match.group(1).strip()
+    fence_match = re.fullmatch(
+        r"```(?:markdown|md|text)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    return cleaned
+
+
 def summarize_with_chunking(
     insights_text: str,
     model,
     chunk_size: int = 50000,
     max_output_tokens: int = 32768,
+    call_model: Optional[Callable[[str, int], tuple]] = None,
 ) -> tuple:
     """
     Guided summarization with chunking, following Claude Cookbooks pattern:
@@ -233,12 +261,16 @@ def summarize_with_chunking(
         # Single chunk - directly summarize
         print("  Single chunk, summarizing directly...")
         prompt = CHUNK_SUMMARY_PROMPT.format(text=chunks[0])
-        summary, token_info = call_gemini(model, prompt, max_new_tokens=max_output_tokens)
+        if call_model is None:
+            summary, token_info = call_gemini(
+                model, prompt, max_new_tokens=max_output_tokens
+            )
+        else:
+            summary, token_info = call_model(prompt, max_output_tokens)
         total_output_tokens += token_info.get("output_tokens", 0)
-        # Extract content within <summary> tags if present
-        match = re.search(r"<summary>(.*?)</summary>", summary, re.DOTALL)
-        if match:
-            summary = match.group(1).strip()
+        summary = clean_summary_response(summary)
+        if not summary:
+            raise RuntimeError("Model returned an empty compact summary")
         return summary, total_output_tokens
 
     # Multiple chunks - hierarchical summarization
@@ -246,12 +278,18 @@ def summarize_with_chunking(
     for i, chunk in enumerate(chunks):
         print(f"  Summarizing chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)...")
         prompt = CHUNK_SUMMARY_PROMPT.format(text=chunk)
-        chunk_summary, token_info = call_gemini(model, prompt, max_new_tokens=max_output_tokens)
+        if call_model is None:
+            chunk_summary, token_info = call_gemini(
+                model, prompt, max_new_tokens=max_output_tokens
+            )
+        else:
+            chunk_summary, token_info = call_model(prompt, max_output_tokens)
         total_output_tokens += token_info.get("output_tokens", 0)
-        # Extract content within <summary> tags if present
-        match = re.search(r"<summary>(.*?)</summary>", chunk_summary, re.DOTALL)
-        if match:
-            chunk_summary = match.group(1).strip()
+        chunk_summary = clean_summary_response(chunk_summary)
+        if not chunk_summary:
+            raise RuntimeError(
+                f"Model returned an empty compact summary for chunk {i + 1}"
+            )
         chunk_summaries.append(chunk_summary)
         print(f"    Chunk {i + 1} summary: {len(chunk_summary)} chars")
 
@@ -264,17 +302,27 @@ def summarize_with_chunking(
     # If combined summaries are still too large, recursively chunk
     if len(combined) > chunk_size:
         print(f"  Combined summaries exceed chunk_size, recursing...")
-        final_summary, rec_tok = summarize_with_chunking(combined, model, chunk_size, max_output_tokens)
+        final_summary, rec_tok = summarize_with_chunking(
+            combined,
+            model,
+            chunk_size,
+            max_output_tokens,
+            call_model=call_model,
+        )
         return final_summary, total_output_tokens + rec_tok
 
     prompt = FINAL_CONSOLIDATION_PROMPT.format(text=combined)
-    final_summary, token_info = call_gemini(model, prompt, max_new_tokens=max_output_tokens)
+    if call_model is None:
+        final_summary, token_info = call_gemini(
+            model, prompt, max_new_tokens=max_output_tokens
+        )
+    else:
+        final_summary, token_info = call_model(prompt, max_output_tokens)
     total_output_tokens += token_info.get("output_tokens", 0)
 
-    # Extract content within <summary> tags if present
-    match = re.search(r"<summary>(.*?)</summary>", final_summary, re.DOTALL)
-    if match:
-        final_summary = match.group(1).strip()
+    final_summary = clean_summary_response(final_summary)
+    if not final_summary:
+        raise RuntimeError("Model returned an empty final compact summary")
 
     return final_summary, total_output_tokens
 
@@ -284,11 +332,11 @@ def summarize_with_chunking(
 # ---------------------------------------------------------------------------
 
 def save_encyclopedia(summary: str, output_dir: str):
-    """Save compacted summary as encyclopedia.json with {"insight": summary} format."""
+    """Save compacted summary using the canonical flat insight_* protocol."""
     os.makedirs(output_dir, exist_ok=True)
     encyclopedia_path = os.path.join(output_dir, "encyclopedia.json")
 
-    encyclopedia = {"insight": summary}
+    encyclopedia = {"insight_summary": summary}
 
     with open(encyclopedia_path, "w", encoding="utf-8") as f:
         json.dump(encyclopedia, f, indent=2, ensure_ascii=False)

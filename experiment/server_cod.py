@@ -9,7 +9,7 @@ Step 2: Apply Chain of Density (CoD) summarization from:
         - Iteratively generate 5 increasingly dense summaries
         - Each iteration adds 1-3 missing entities while maintaining word count
         - Final (5th) summary is the most dense and is saved as encyclopedia
-Output: encyclopedia.json with {"insight": <densest_summary>}
+Output: encyclopedia.json with {"insight_summary": <densest_summary>}
 """
 
 import argparse
@@ -18,7 +18,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from utils import setup_gemini, call_gemini
 
@@ -26,6 +26,9 @@ from utils import setup_gemini, call_gemini
 # ---------------------------------------------------------------------------
 # Chain of Density prompt (exact prompt from Adams et al., 2023)
 # ---------------------------------------------------------------------------
+
+DEFAULT_SUMMARY_WORDS = 80
+
 
 COD_PROMPT = """\
 Article: {article}
@@ -35,7 +38,7 @@ Step 1. Identify 1-3 informative Entities (";" delimited) from the Article which
 Step 2. Write a new, denser summary of identical length which covers every entity and detail from the previous summary plus the Missing Entities.
 A Missing Entity is: - Relevant: to the main story. - Specific: descriptive yet concise (5 words or fewer). - Novel: not in the previous summary. - Faithful: present in the Article. - Anywhere: located anywhere in the Article.
 Guidelines:
-- The first summary should be long (4-5 sentences, ~80 words) yet highly non-specific, containing little information beyond the entities marked as missing. Use overly verbose language and fillers (e.g., "this article discusses") to reach ~80 words.
+- The first summary should be approximately {summary_words} words yet highly non-specific, containing little information beyond the entities marked as missing. Use overly verbose language and fillers (e.g., "this article discusses") to reach approximately {summary_words} words.
 - Make every word count: re-write the previous summary to improve flow and make space for additional entities.
 - Make space with fusion, compression, and removal of uninformative phrases like "the article discusses".
 - The summaries should become highly dense and concise yet self-contained, e.g., easily understood without the Article.
@@ -181,38 +184,121 @@ def chunk_text(text: str, chunk_size: int = 50000) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
+def _strip_reasoning_blocks(response_text: str) -> str:
+    """Remove reasoning tags sometimes emitted in DeepSeek message content."""
+    return re.sub(
+        r"<think\b[^>]*>.*?</think>",
+        "",
+        response_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+
+def _normalize_cod_payload(payload) -> list:
+    """Normalize common OpenAI-compatible JSON variants to the CoD schema."""
+    if isinstance(payload, dict):
+        for key in ("summaries", "chain_of_density", "results", "output"):
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                payload = candidate
+                break
+
+    if not isinstance(payload, list):
+        raise ValueError("CoD response must contain a JSON list")
+    if len(payload) != 5:
+        raise ValueError(
+            f"CoD response must contain exactly 5 summaries; got {len(payload)}"
+        )
+
+    normalized = []
+    for index, entry in enumerate(payload, 1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"CoD summary {index} is not a JSON object")
+        keys = {
+            re.sub(r"[^a-z0-9]", "", str(key).lower()): value
+            for key, value in entry.items()
+        }
+        missing = keys.get("missingentities", "")
+        summary = keys.get("densersummary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError(
+                f"CoD summary {index} has no non-empty Denser_Summary"
+            )
+        if isinstance(missing, list):
+            missing = "; ".join(str(item) for item in missing)
+        normalized.append(
+            {
+                "Missing_Entities": str(missing),
+                "Denser_Summary": summary.strip(),
+            }
+        )
+    return normalized
+
+
 def extract_json_from_response(response_text: str) -> list:
-    """Extract JSON list from LLM response, handling markdown code blocks."""
-    # Try to find JSON in code blocks first
-    match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", response_text, re.DOTALL)
-    if match:
-        return json.loads(match.group(1))
+    """Extract and validate CoD JSON from Gemini or DeepSeek-style output."""
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise ValueError("CoD response is empty")
 
-    # Try to find raw JSON list
-    match = re.search(r"\[.*\]", response_text, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
+    cleaned = _strip_reasoning_blocks(response_text)
+    fenced = re.findall(
+        r"```(?:json)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    candidates = fenced + [cleaned]
+    decoder = json.JSONDecoder()
+    errors = []
+    for candidate in candidates:
+        for start, character in enumerate(candidate):
+            if character not in "[{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(candidate[start:])
+                return _normalize_cod_payload(payload)
+            except (json.JSONDecodeError, ValueError) as exc:
+                errors.append(str(exc))
+    detail = next(
+        (error for error in errors if "exactly 5 summaries" in error),
+        errors[-1] if errors else "no JSON value found",
+    )
+    raise ValueError(f"Could not parse a valid CoD response: {detail}")
 
-    # Try parsing the whole response
-    return json.loads(response_text)
 
-
-def cod_summarize(article_text: str, model, max_output_tokens: int = 32768) -> tuple:
+def cod_summarize(
+    article_text: str,
+    model,
+    max_output_tokens: int = 32768,
+    call_model: Optional[Callable[[str, int], tuple]] = None,
+    summary_words: int = DEFAULT_SUMMARY_WORDS,
+) -> tuple:
     """
     Apply Chain of Density prompting to a single article/text block.
 
     Returns (densest_summary, output_tokens).
     """
-    prompt = COD_PROMPT.format(article=article_text)
-    response, token_info = call_gemini(model, prompt, max_new_tokens=max_output_tokens)
+    if summary_words < 1:
+        raise ValueError("summary_words must be positive")
+    prompt = COD_PROMPT.format(
+        article=article_text,
+        summary_words=summary_words,
+    )
+    if call_model is None:
+        response, token_info = call_gemini(
+            model, prompt, max_new_tokens=max_output_tokens
+        )
+    else:
+        response, token_info = call_model(prompt, max_output_tokens)
     out_tok = token_info.get("output_tokens", 0)
 
     try:
         cod_results = extract_json_from_response(response)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"  Warning: Failed to parse CoD JSON response: {e}")
-        print(f"  Raw response:\n{response}")
-        return response, out_tok
+        preview = response[:2000] if isinstance(response, str) else str(response)
+        raise RuntimeError(
+            "Model returned an invalid Chain-of-Density response: "
+            f"{e}. Response preview: {preview}"
+        ) from e
 
     # Print each iteration
     for i, entry in enumerate(cod_results):
@@ -231,6 +317,8 @@ def cod_summarize_with_chunking(
     model,
     chunk_size: int = 50000,
     max_output_tokens: int = 32768,
+    call_model: Optional[Callable[[str, int], tuple]] = None,
+    summary_words: int = DEFAULT_SUMMARY_WORDS,
 ) -> tuple:
     """
     Apply Chain of Density summarization with chunking for large inputs.
@@ -249,13 +337,19 @@ def cod_summarize_with_chunking(
     if len(chunks) == 1:
         # Single chunk - directly apply CoD
         print("  Single chunk, applying Chain of Density directly...")
-        return cod_summarize(chunks[0], model, max_output_tokens)
+        return cod_summarize(
+            chunks[0], model, max_output_tokens, call_model=call_model,
+            summary_words=summary_words,
+        )
 
     # Multiple chunks - CoD each chunk, then consolidate
     chunk_summaries = []
     for i, chunk in enumerate(chunks):
         print(f"\n  --- Chunk {i + 1}/{len(chunks)} ({len(chunk)} chars) ---")
-        summary, _ = cod_summarize(chunk, model, max_output_tokens)
+        summary, _ = cod_summarize(
+            chunk, model, max_output_tokens, call_model=call_model,
+            summary_words=summary_words,
+        )
         chunk_summaries.append(summary)
         print(f"  Chunk {i + 1} densest summary: {len(summary.split())} words")
 
@@ -268,10 +362,20 @@ def cod_summarize_with_chunking(
     # If combined is still too large, recursively chunk
     if len(combined) > chunk_size:
         print(f"  Combined summaries exceed chunk_size, recursing...")
-        return cod_summarize_with_chunking(combined, model, chunk_size, max_output_tokens)
+        return cod_summarize_with_chunking(
+            combined,
+            model,
+            chunk_size,
+            max_output_tokens,
+            call_model=call_model,
+            summary_words=summary_words,
+        )
 
     # Final call — this produces the library; return its token count
-    return cod_summarize(combined, model, max_output_tokens)
+    return cod_summarize(
+        combined, model, max_output_tokens, call_model=call_model,
+        summary_words=summary_words,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +383,11 @@ def cod_summarize_with_chunking(
 # ---------------------------------------------------------------------------
 
 def save_encyclopedia(summary: str, output_dir: str):
-    """Save densest summary as encyclopedia.json with {"insight": summary} format."""
+    """Save densest summary using the canonical flat insight_* protocol."""
     os.makedirs(output_dir, exist_ok=True)
     encyclopedia_path = os.path.join(output_dir, "encyclopedia.json")
 
-    encyclopedia = {"insight": summary}
+    encyclopedia = {"insight_summary": summary}
 
     with open(encyclopedia_path, "w", encoding="utf-8") as f:
         json.dump(encyclopedia, f, indent=2, ensure_ascii=False)
@@ -327,8 +431,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gemini-model",
         type=str,
-        default="gemini-2.0-flash",
-        help="Gemini model name (default: gemini-2.0-flash)",
+        default="gemini-2.5-flash",
+        help="Gemini model name (default: gemini-2.5-flash)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -336,8 +440,20 @@ if __name__ == "__main__":
         default=50000,
         help="Max characters per chunk for CoD summarization (default: 50000)",
     )
+    parser.add_argument(
+        "--cod-summary-words",
+        type=int,
+        default=DEFAULT_SUMMARY_WORDS,
+        help=(
+            "Target word count for every Chain-of-Density summary "
+            f"(default: {DEFAULT_SUMMARY_WORDS})"
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.cod_summary_words < 1:
+        parser.error("--cod-summary-words must be positive")
 
     start_time = time.time()
 
@@ -363,6 +479,7 @@ if __name__ == "__main__":
         insights_text,
         model=gemini_model,
         chunk_size=args.chunk_size,
+        summary_words=args.cod_summary_words,
     )
 
     print(f"\nDensest summary:\n{summary}")

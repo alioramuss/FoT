@@ -10,6 +10,7 @@ Pipeline:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,8 @@ from utils import (
     setup_gemini,
     call_gemini,
     call_openrouter,
+    normalize_api_model,
+    resolve_api_key,
     load_hf_model,
     call_hf_model,
 )
@@ -45,6 +48,8 @@ class TextBasedInsightAggregationServer:
         use_api: bool = False,
         api_key: Optional[str] = None,
         api_provider: str = "gemini",
+        api_model: Optional[str] = None,
+        reasoning_enabled: Optional[bool] = None,
         num_insights: Optional[int] = None,
         max_files: Optional[int] = None,
         custom_prompt_section: str = "",
@@ -69,13 +74,19 @@ class TextBasedInsightAggregationServer:
 
         # API support
         self.use_api = use_api
-        self.api_provider = api_provider
-        self.api_key = api_key or (os.getenv("GEMINI_API_KEY") if api_provider == "gemini" else os.getenv("OPENROUTER_API_KEY"))
-        self.api_model_name = None  # set externally if needed
+        self.api_provider = api_provider.strip().lower()
+        self.reasoning_enabled = reasoning_enabled
+        self.api_key = resolve_api_key(self.api_provider, api_key)
+        default_model = (
+            "gemini-2.5-flash-lite" if self.api_provider == "gemini" else None
+        )
+        self.api_model_name = normalize_api_model(
+            self.api_provider, api_model or default_model
+        )
         if self.use_api and self.api_provider == "gemini":
             self.gemini_model = setup_gemini(
                 api_key=self.api_key,
-                model_name="gemini-3-pro-preview",
+                model_name=self.api_model_name,
             )
 
         # Model and tokenizer will be loaded lazily on first use (only for HuggingFace models)
@@ -96,6 +107,8 @@ class TextBasedInsightAggregationServer:
         prompt: str,
         system_prompt: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
+        response_format: Optional[Dict] = None,
+        reasoning_enabled: Optional[bool] = None,
     ) -> tuple:
         """
         Call the language model (HuggingFace or Gemini API).
@@ -105,8 +118,15 @@ class TextBasedInsightAggregationServer:
         """
         if self.use_api:
             if self.api_provider == "openrouter":
-                model = getattr(self, "api_model_name", None) or "anthropic/claude-opus-4.6"
-                text, token_info = call_openrouter(self.api_key, model, prompt, system_prompt, max_new_tokens)
+                text, token_info = call_openrouter(
+                    self.api_key,
+                    self.api_model_name,
+                    prompt,
+                    system_prompt,
+                    max_new_tokens,
+                    response_format=response_format,
+                    reasoning_enabled=reasoning_enabled,
+                )
             else:
                 text, token_info = call_gemini(
                     self.gemini_model, prompt, system_prompt, max_new_tokens,
@@ -126,6 +146,167 @@ class TextBasedInsightAggregationServer:
         if not self.custom_prompt_section:
             return prompt
         return f"{self.custom_prompt_section}\n\n{prompt}"
+
+    @staticmethod
+    def _require_nonempty_text(value, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} is empty.")
+        return value
+
+    @classmethod
+    def _validate_reasoning_traces(cls, insight_store: Dict) -> None:
+        if not isinstance(insight_store, dict) or not insight_store:
+            raise ValueError("Reasoning traces are empty.")
+        for trace_name, trace_content in insight_store.items():
+            cls._require_nonempty_text(str(trace_name), "Reasoning trace name")
+            cls._require_nonempty_text(
+                trace_content, f"Reasoning trace '{trace_name}' content"
+            )
+
+    @staticmethod
+    def _validate_profiling(profiling: Dict) -> None:
+        if not isinstance(profiling, dict) or not profiling:
+            raise ValueError("Cluster and relationship information is empty.")
+
+        raw_profiling_text = profiling.get("raw_profiling_text")
+        if isinstance(raw_profiling_text, str) and raw_profiling_text.strip():
+            # Sanctioned fallback shape (see _step_text_profiling): the
+            # model's response couldn't be parsed as structured clusters/
+            # relationships, so the raw text was carried forward instead.
+            # That's a complete, legitimate profiling result on its own —
+            # nothing further to validate structurally.
+            return
+
+        clusters = profiling.get("clusters")
+        if not isinstance(clusters, list) or not clusters:
+            raise ValueError("Cluster information is empty.")
+        if any(not isinstance(cluster, dict) or not cluster for cluster in clusters):
+            raise ValueError("Cluster information contains an empty or invalid cluster.")
+        for index, cluster in enumerate(clusters):
+            if "cluster_id" not in cluster:
+                raise ValueError(f"Cluster {index} is missing 'cluster_id'.")
+            if not isinstance(cluster.get("cluster_name"), str) or not cluster[
+                "cluster_name"
+            ].strip():
+                raise ValueError(f"Cluster {index} has an empty 'cluster_name'.")
+            traces = cluster.get("traces")
+            if not isinstance(traces, list) or not traces:
+                raise ValueError(f"Cluster {index} has no trace members.")
+            if any(not isinstance(trace, str) or not trace.strip() for trace in traces):
+                raise ValueError(f"Cluster {index} contains an empty trace name.")
+            if not isinstance(cluster.get("theme"), str) or not cluster["theme"].strip():
+                raise ValueError(f"Cluster {index} has an empty 'theme'.")
+
+        relationships = profiling.get("relationships")
+        if not isinstance(relationships, list) or not relationships:
+            raise ValueError("Relationship information is empty.")
+        if any(
+            not isinstance(relationship, dict) or not relationship
+            for relationship in relationships
+        ):
+            raise ValueError(
+                "Relationship information contains an empty or invalid relationship."
+            )
+        required_relationship_fields = (
+            "trace_a",
+            "trace_b",
+            "relationship_type",
+            "description",
+        )
+        for index, relationship in enumerate(relationships):
+            for field in required_relationship_fields:
+                value = relationship.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"Relationship {index} has an empty or missing '{field}'."
+                    )
+
+    @classmethod
+    def _sanitize_profiling(cls, profiling: Dict) -> Tuple[Dict, List[str]]:
+        """Drop malformed clusters/relationships instead of failing the whole
+        profiling step over one bad entry (e.g. a relationship missing
+        'trace_b'). Parseable JSON with some good entries is salvaged; only
+        a response with nothing usable at all should fall back further to
+        the raw-text path in _step_text_profiling.
+        """
+        dropped: List[str] = []
+
+        clusters = profiling.get("clusters") if isinstance(profiling, dict) else None
+        cleaned_clusters: List[Dict] = []
+        if isinstance(clusters, list):
+            for index, cluster in enumerate(clusters):
+                traces = cluster.get("traces") if isinstance(cluster, dict) else None
+                valid = (
+                    isinstance(cluster, dict)
+                    and bool(cluster)
+                    and "cluster_id" in cluster
+                    and isinstance(cluster.get("cluster_name"), str)
+                    and cluster["cluster_name"].strip()
+                    and isinstance(traces, list)
+                    and bool(traces)
+                    and all(isinstance(t, str) and t.strip() for t in traces)
+                    and isinstance(cluster.get("theme"), str)
+                    and cluster["theme"].strip()
+                )
+                if valid:
+                    cleaned_clusters.append(cluster)
+                else:
+                    dropped.append(f"cluster[{index}]")
+
+        relationships = profiling.get("relationships") if isinstance(profiling, dict) else None
+        cleaned_relationships: List[Dict] = []
+        required_relationship_fields = ("trace_a", "trace_b", "relationship_type", "description")
+        if isinstance(relationships, list):
+            for index, relationship in enumerate(relationships):
+                valid = isinstance(relationship, dict) and bool(relationship) and all(
+                    isinstance(relationship.get(field), str) and relationship[field].strip()
+                    for field in required_relationship_fields
+                )
+                if valid:
+                    cleaned_relationships.append(relationship)
+                else:
+                    dropped.append(f"relationship[{index}]")
+
+        return {"clusters": cleaned_clusters, "relationships": cleaned_relationships}, dropped
+
+    @classmethod
+    def _validate_insight_library(cls, insight_library: Dict) -> None:
+        if not isinstance(insight_library, dict) or not insight_library:
+            raise ValueError("Insight library is empty.")
+        for insight_name, insight_content in insight_library.items():
+            cls._require_nonempty_text(str(insight_name), "Insight name")
+            if not str(insight_name).startswith("insight_"):
+                raise ValueError(
+                    f"Insight name '{insight_name}' must start with 'insight_'."
+                )
+            cls._require_nonempty_text(
+                insight_content, f"Insight '{insight_name}' content"
+            )
+
+    @classmethod
+    def _sanitize_insight_library(
+        cls, insight_library: Optional[Dict]
+    ) -> Tuple[Dict[str, str], List[str]]:
+        """Drop malformed entries instead of failing the whole aggregation.
+
+        A single degenerate LLM response can otherwise crash a multi-hour,
+        multi-iteration run over one empty value or one stray non-'insight_'
+        key. Keep every entry that *is* well-formed and report the rest so
+        the caller can log and, if nothing usable survives, retry.
+        """
+        if not isinstance(insight_library, dict):
+            return {}, []
+        cleaned: Dict[str, str] = {}
+        dropped: List[str] = []
+        for insight_name, insight_content in insight_library.items():
+            name = str(insight_name).strip() if insight_name is not None else ""
+            valid_name = bool(name) and name.startswith("insight_")
+            valid_content = isinstance(insight_content, str) and bool(insight_content.strip())
+            if valid_name and valid_content:
+                cleaned[name] = insight_content
+            else:
+                dropped.append(name or repr(insight_name))
+        return cleaned, dropped
 
     def collect_insight_books(self, json_files: Optional[List[str]] = None) -> Dict:
         """
@@ -176,13 +357,9 @@ class TextBasedInsightAggregationServer:
                 print(f"Randomly sampled {self.max_files} files (seed={seed_str})")
 
         if not json_files:
-            print("ERROR: No problem*.json or paper*.json files found!")
-            return {
-                "step": 1,
-                "name": "Collect Insights",
-                "files_processed": 0,
-                "error": "No files found",
-            }
+            raise ValueError(
+                "Reasoning traces are empty: no problem*.json or paper*.json files were found."
+            )
 
         all_insights = {}  # Store all insights with indexed keys
         insight_counter = 0  # Global counter for all insights
@@ -254,6 +431,7 @@ class TextBasedInsightAggregationServer:
 
         # Store in insight_store
         self.insight_store = all_insights
+        self._validate_reasoning_traces(self.insight_store)
 
         step_result = {
             "step": 1,
@@ -326,7 +504,7 @@ Map relationships between traces within clusters and across clusters.
       "cluster_id": 0,
       "cluster_name": "Domain/Theme Name",
       "traces": ["name1", "name2", "name3"],
-      "theme": "What is the high-level techniqual idea of the traces in this cluster?",
+      "theme": "What is the high-level techniqual idea of the traces in this cluster?"
     }}
   ],
   "relationships": [
@@ -344,11 +522,87 @@ Map relationships between traces within clusters and across clusters.
 """
         return prompt
 
-    def _step_text_profiling(self, insight_store: Dict) -> Dict:
+    @staticmethod
+    def _profiling_response_format() -> Dict:
+        """Strict schema for the complete Prompt-4 profiling result."""
+        nonempty_string = {"type": "string", "minLength": 1}
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "trace_relationship_profiling",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "clusters": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "cluster_id": {"type": "integer"},
+                                    "cluster_name": nonempty_string,
+                                    "traces": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": nonempty_string,
+                                    },
+                                    "theme": nonempty_string,
+                                },
+                                "required": [
+                                    "cluster_id",
+                                    "cluster_name",
+                                    "traces",
+                                    "theme",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "relationships": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "trace_a": nonempty_string,
+                                    "trace_b": nonempty_string,
+                                    "relationship_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "prerequisite",
+                                            "complementary",
+                                            "alternative",
+                                            "similar",
+                                            "derived_from",
+                                            "composes_with",
+                                        ],
+                                    },
+                                    "description": nonempty_string,
+                                },
+                                "required": [
+                                    "trace_a",
+                                    "trace_b",
+                                    "relationship_type",
+                                    "description",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["clusters", "relationships"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _step_text_profiling(
+        self, insight_store: Dict, output_dir: Optional[str] = None
+    ) -> Dict:
         """Step 2: Text-based profiling of insight relationships
 
         Note: insight_store contains ALL collected skills without deduplication.
         """
+        self._validate_reasoning_traces(insight_store)
         print("Building text-based profiling of insight relationships...")
         print(f"Analyzing ALL {len(insight_store)} collected insights (no deduplication)...")
 
@@ -356,28 +610,77 @@ Map relationships between traces within clusters and across clusters.
         prompt = self._prepend_custom_prompt(prompt)
         system_prompt = None
 
-        if "deepseek" in self.model_name.lower():
-            max_tokens=32768
-        else:
-            max_tokens=65536
-
-        response,output_tokens = self._call_model(prompt, system_prompt, max_new_tokens=max_tokens)
+        response_format = (
+            self._profiling_response_format()
+            if self.use_api and self.api_provider == "openrouter"
+            else None
+        )
+        response,output_tokens = self._call_model(
+            prompt,
+            system_prompt,
+            max_new_tokens=16384,
+            response_format=response_format,
+            reasoning_enabled=(
+                self.reasoning_enabled
+                if self.reasoning_enabled is not None
+                else (False if response_format is not None else None)
+            ),
+        )
+        raw_response_path = None
+        if output_dir:
+            raw_response_path = Path(output_dir) / "profiling_raw_response.txt"
+            raw_response_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = raw_response_path.with_name(
+                f".{raw_response_path.name}.tmp"
+            )
+            temporary.write_text(response, encoding="utf-8")
+            os.replace(temporary, raw_response_path)
+        self._require_nonempty_text(response, "Cluster and relationship model response")
         print(f"Text profiling response received (output tokens: {output_tokens['output_tokens']}):")
 
         # Extract JSON from response
         json_content = self._extract_json_only(response)
         profiling_data = self._try_parse_json(json_content)
 
+        if profiling_data is not None:
+            # Parsed fine, but individual clusters/relationships can still be
+            # malformed (e.g. a relationship missing 'trace_b'). Salvage the
+            # good entries instead of failing the whole step over one bad
+            # one — only fall through to the raw-text path below if nothing
+            # usable survives.
+            profiling_data, dropped = self._sanitize_profiling(profiling_data)
+            if dropped:
+                preview = ", ".join(dropped[:5]) + (", ..." if len(dropped) > 5 else "")
+                print(
+                    f"  Warning: dropped {len(dropped)} malformed cluster/"
+                    f"relationship entr{'y' if len(dropped) == 1 else 'ies'}: {preview}"
+                )
+            if not profiling_data["clusters"] and not profiling_data["relationships"]:
+                profiling_data = None
+
         if profiling_data is None:
+            # Completely unparseable, or parseable with nothing usable left
+            # after sanitization — rather than crash the whole multi-
+            # iteration run, carry the raw response forward as unstructured
+            # context. _get_knowledge_extraction_prompt reads
+            # 'raw_profiling_text' and substitutes it for the (now empty)
+            # structured cluster/relationship sections in Step 3's prompt.
             print(
-                "Warning: Could not parse profiling JSON. Falling back to minimal structure."
+                "Warning: could not salvage any valid cluster or relationship "
+                f"information (finish_reason={output_tokens.get('finish_reason')!r}, "
+                f"used_reasoning_fallback="
+                f"{output_tokens.get('used_reasoning_fallback', False)}, "
+                f"response_chars={len(response)}, "
+                f"raw_response_path={str(raw_response_path) if raw_response_path else 'not saved'}). "
+                "Passing the raw response through to Step 3 as unstructured text instead."
             )
             profiling_data = {
                 "clusters": [],
                 "relationships": [],
-                "insights": list(insight_store.keys()),
-                "raw_response": response,
+                "raw_profiling_text": response,
             }
+
+        self._validate_profiling(profiling_data)
 
         self.insight_relationships = profiling_data
 
@@ -407,15 +710,39 @@ Map relationships between traces within clusters and across clusters.
         - Anthropic Insights: Composable, portable insight structure
         """
 
-        # Format clusters
-        clusters_text = ""
-        if isinstance(profiling, dict) and "clusters" in profiling:
-            clusters_text = "\n".join(
-                [
-                    f"- Cluster {cluster.get('cluster_id', '?')} ({cluster.get('cluster_name', 'unnamed')}): "
-                    f"{', '.join(cluster.get('insights', []))}"
-                    for cluster in profiling["clusters"]
-                ]
+        # Preserve the complete profiling output. In particular, do not flatten
+        # clusters here: doing so can silently omit trace membership, themes, or
+        # additional fields produced by the profiling model.
+        clusters = profiling.get("clusters", []) if isinstance(profiling, dict) else []
+        relationships = (
+            profiling.get("relationships", []) if isinstance(profiling, dict) else []
+        )
+        raw_profiling_text = (
+            profiling.get("raw_profiling_text") if isinstance(profiling, dict) else None
+        )
+        if raw_profiling_text:
+            # Step 2's response couldn't be parsed as structured JSON this
+            # round; fall back to the raw text instead of empty clusters/
+            # relationships sections, so Step 3 still has something to work with.
+            clusters_section = (
+                "- The automated cluster analysis for this round could not be "
+                "parsed as structured JSON. Use its raw text below as "
+                "unstructured context to help organize the insight library:\n"
+                f"{raw_profiling_text}"
+            )
+            relationships_section = ""
+        else:
+            clusters_text = json.dumps(clusters, indent=2, ensure_ascii=False)
+            relationships_text = json.dumps(relationships, indent=2, ensure_ascii=False)
+            clusters_section = (
+                "- Use the complete cluster analysis below, including every "
+                "cluster's trace membership, theme, and any other returned "
+                f"fields, to help organize the insight library:\n{clusters_text}"
+            )
+            relationships_section = (
+                "- Use the complete trace relationships below, including every "
+                "relationship's endpoints, type, description, and any other "
+                f"returned fields, to help organize the insight library:\n{relationships_text}"
             )
 
         # Format all insights from insight_store (for reference)
@@ -452,8 +779,22 @@ Map relationships between traces within clusters and across clusters.
         if not existing_encyclopedia:
             print("No existing encyclopedia provided.")
 
-        proper_number = f"{self.num_insights}" if self.num_insights is not None else (int(math.log10(len(insight_store))*10 + 1) if len(insight_store) > 0 else "a reasonable number")
+        proper_number = f"exactly {self.num_insights}" if self.num_insights is not None else "a reasonable number"
+        # (int(math.log10(len(insight_store))*10 + 1) if len(insight_store) > 0 else 
         print(f"Proper number of insights to extract: {proper_number} over {len(insight_store)} collected insights")
+
+        exact_count_requirement = (
+            f"8. The JSON object must contain EXACTLY {self.num_insights} "
+            "top-level insight entries. Count them before responding."
+            if self.num_insights is not None
+            else ""
+        )
+        uncertainty_rule = (
+            f"- Even if uncertain, return exactly {self.num_insights} valid insights; "
+            "never return a partial library or free text."
+            if self.num_insights is not None
+            else "- If uncertain, still output a valid JSON object, never free text."
+        )
 
         prompt = f"""
 **Your Task:**
@@ -467,6 +808,7 @@ You are extracting fundamental insights from a collection of problem-solving tra
 5. Every key must start with "insight_".
 6. Every value must be a single string.
 7. No nested objects, no nested arrays.
+{exact_count_requirement}
 
 **Required JSON shape:**
 {{
@@ -478,17 +820,17 @@ You are extracting fundamental insights from a collection of problem-solving tra
 - Use valid JSON syntax only.
 - Keep top-level as key-value pairs only.
 - Escape quotes in descriptions with backslash: \\" 
-- If uncertain, still output a valid JSON object (possibly with fewer insights), never free text.
+{uncertainty_rule}
 
 Your goal is to extract a comprehensive set of fundamental, cross-domain insights that can be derived and applied beyond their original domain meet following requirements: 
 - Combine previous insights (if any): {existing_encyclopedia if existing_encyclopedia else "None"} with new insights.
 - Extract your insights based on all client reasoning traces: {all_insights_text}. These traces are derived from solving specific problems (bottom-up approach)
-- Use clusters of reasoning traces: {clusters_text if clusters_text else "None identified"} to help organize.
-- Use relationships between traces: {json.dumps(profiling.get('relationships', []), indent=2) if isinstance(profiling, dict) else "None identified"} to help organization
+{clusters_section}
+{relationships_section}
 - Your task is to extract multi-disciplinary, fundamental knowledge (top-down approach) which can be generalized to multi-domain problem-solving.
 - The extracted insights should be able to DERIVE and GUIDE the use of the collected insights
 - The extraced insights cannot be too general. They are not supposed to be knowledge which can be applied to any problem. They should be fundamental knowlege to particular several domains but specific.
-- You should extra {proper_number} insights. Not too few. Not too many.Do not over simplified or too detailed.
+- You must extract {proper_number} insights. Do not return fewer or more. Do not over-simplify or make descriptions needlessly long.
 - DO NOT over-merge insights.
 
 Insights should have following properties:
@@ -542,6 +884,8 @@ Output aggregated insight:
         self, insight_store: Dict, profiling: Dict, existing_encyclopedia: str = ""
     ) -> Dict:
         """Step 3: Extract general, fundamental knowledge"""
+        self._validate_reasoning_traces(insight_store)
+        self._validate_profiling(profiling)
         print("Extracting general, fundamental knowledge...")
 
         prompt = self._get_knowledge_extraction_prompt(
@@ -550,43 +894,117 @@ Output aggregated insight:
         prompt = self._prepend_custom_prompt(prompt)
         system_prompt = None
 
-        if "deepseek" in self.model_name.lower():   
-            max_tokens = 32768
-        else:
-            max_tokens = 65536 
-        response,output_tokens = self._call_model(
-            prompt,
-            system_prompt,
-            max_new_tokens=max_tokens,
+        response_format = (
+            {"type": "json_object"}
+            if self.use_api and self.api_provider == "openrouter"
+            else None
         )
-        print(response)
-        print(f"Knowledge extraction response generated {output_tokens['output_tokens']} tokens")
-        if self.last_generation_info:
-            print(
-                "Step 3 generation stop reason: "
-                f"{self.last_generation_info.get('finish_reason', 'unknown')} "
-                f"(output_tokens={self.last_generation_info.get('output_tokens', 'n/a')}, "
-                f"max_new_tokens={self.last_generation_info.get('max_new_tokens', 'n/a')})"
+        # A single degenerate response (partial JSON with one empty value,
+        # or a stray hallucinated non-'insight_' key) used to crash the
+        # entire multi-iteration run right here. Sanitize instead of
+        # rejecting outright, and only retry the model call if literally
+        # nothing usable survives sanitization.
+        max_attempts = 3 if self.num_insights is not None else 2
+        encyclopedia_dict: Dict[str, str] = {}
+        json_content = ""
+        response = ""
+        total_output_tokens = 0
+        for attempt in range(1, max_attempts + 1):
+            attempt_prompt = prompt
+            if attempt > 1:
+                count_requirement = (
+                    f" The corrected JSON must contain exactly {self.num_insights} "
+                    "valid top-level insight entries."
+                    if self.num_insights is not None
+                    else ""
+                )
+                attempt_prompt = (
+                    prompt
+                    + "\n\nCRITICAL JSON REGENERATION: The prior response contained "
+                    "no usable insights (empty values, non-'insight_'-prefixed keys, "
+                    "or truncated/garbled entries). Regenerate the complete answer: "
+                    "every key must start with 'insight_' and every value must be a "
+                    "complete, non-empty description string. Include no other keys."
+                    + count_requirement
+                )
+            response, output_tokens = self._call_model(
+                attempt_prompt,
+                system_prompt,
+                max_new_tokens=16384,
+                response_format=response_format,
+                reasoning_enabled=(
+                    self.reasoning_enabled
+                    if self.reasoning_enabled is not None
+                    else (False if response_format is not None else None)
+                ),
             )
+            self._require_nonempty_text(response, "Knowledge-extraction solution")
+            print(response)
+            total_output_tokens += int(output_tokens.get("output_tokens", 0) or 0)
+            print(f"Knowledge extraction response generated {output_tokens['output_tokens']} tokens")
+            if self.last_generation_info:
+                print(
+                    "Step 3 generation stop reason: "
+                    f"{self.last_generation_info.get('finish_reason', 'unknown')} "
+                    f"(output_tokens={self.last_generation_info.get('output_tokens', 'n/a')}, "
+                    f"max_new_tokens={self.last_generation_info.get('max_new_tokens', 'n/a')})"
+                )
 
-        # Extract JSON from response
-        json_content = self._extract_json_only(response)
-        encyclopedia_dict = self._try_parse_json(json_content)
+            # Extract JSON from response
+            json_content = self._extract_json_only(response)
+            raw_dict = self._try_parse_json(json_content)
 
-        # If JSON parsing fails, extract insights using pattern matching
-        if encyclopedia_dict is None:
-            print("JSON parsing failed - extracting insights using pattern matching...")
-            encyclopedia_dict = self._extract_insights_from_text(response)
-            if encyclopedia_dict:
-                print(f"Successfully extracted {len(encyclopedia_dict)} insights from text")
-                json_content = json.dumps(encyclopedia_dict, indent=2, ensure_ascii=False)
-            else:
-                error_msg = (
-                        "ERROR: Could not extract insights from response after retry.\n"
-                        f"Initial response:\n{response}"
+            # If JSON parsing fails, extract insights using pattern matching
+            if raw_dict is None:
+                print("JSON parsing failed - extracting insights using pattern matching...")
+                raw_dict = self._extract_insights_from_text(response)
+                if raw_dict:
+                    print(f"Successfully extracted {len(raw_dict)} insights from text")
+
+            cleaned, dropped = self._sanitize_insight_library(raw_dict)
+            if dropped:
+                preview = ", ".join(dropped[:5]) + (", ..." if len(dropped) > 5 else "")
+                print(
+                    f"  Warning: dropped {len(dropped)} malformed insight "
+                    f"entr{'y' if len(dropped) == 1 else 'ies'} from the model's "
+                    f"response: {preview}"
+                )
+
+            if self.num_insights is not None and len(cleaned) > self.num_insights:
+                print(
+                    f"  Model returned {len(cleaned)} valid insights; retaining the "
+                    f"first requested {self.num_insights}."
+                )
+                cleaned = dict(list(cleaned.items())[: self.num_insights])
+
+            # A short library is still a usable library. The model saturates
+            # well before an arbitrary target, and discarding a response full
+            # of valid insights just to re-pay for another attempt loses more
+            # than it gains. Only an empty result is worth retrying.
+            if cleaned:
+                if self.num_insights is not None and len(cleaned) < self.num_insights:
+                    print(
+                        f"  Note: kept {len(cleaned)} valid insights out of "
+                        f"{self.num_insights} requested; using the smaller "
+                        "library as-is."
                     )
-                print(error_msg)
-                raise ValueError(error_msg)
+                encyclopedia_dict = cleaned
+                json_content = json.dumps(cleaned, indent=2, ensure_ascii=False)
+                break
+
+            if attempt < max_attempts:
+                print(
+                    "  Retrying knowledge extraction — no valid insights survived "
+                    f"sanitization ({attempt}/{max_attempts})"
+                )
+
+        if not encyclopedia_dict:
+            error_msg = (
+                "ERROR: No valid insights survived after "
+                f"{max_attempts} attempt(s).\nLast response:\n{response}"
+            )
+            print(error_msg)
+            raise ValueError(error_msg)
 
         # Update encyclopedia
         self.encyclopedia = json_content
@@ -598,7 +1016,7 @@ Output aggregated insight:
             "response": response,
             "encyclopedia": json_content,
             "encyclopedia_dict": encyclopedia_dict,
-            "output_tokens": output_tokens.get("output_tokens", 0),
+            "output_tokens": total_output_tokens,
             "timestamp": time.time(),
         }
 
@@ -694,8 +1112,16 @@ Output aggregated insight:
 
     def _load_existing_encyclopedia(self, output_dir: str) -> str:
         """Load existing encyclopedia from output directory if it exists"""
-        encyclopedia_path = os.path.join(output_dir, "encyclopedia.txt")
-        if os.path.exists(encyclopedia_path):
+        candidates = (
+            "encyclopedia.json",
+            "encyclopedia_all.json",
+            "encyclopedia.txt",
+            "encyclopedia_all.txt",
+        )
+        for filename in candidates:
+            encyclopedia_path = os.path.join(output_dir, filename)
+            if not os.path.exists(encyclopedia_path):
+                continue
             try:
                 with open(encyclopedia_path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
@@ -723,6 +1149,11 @@ Output aggregated insight:
         Returns:
             Dictionary containing all aggregation steps and final encyclopedia.
         """
+        self.insight_store = {}
+        self.encyclopedia = ""
+        self.aggregation_steps = []
+        self.insight_relationships = {}
+
         # Step 1: Collect insight Books
         print("\n" + "=" * 80)
         print("STEP 1: Collecting insight Books")
@@ -767,21 +1198,110 @@ Output aggregated insight:
 
         print(f"Total insight datastore tokens: {insight_datastore_tokens}")
 
-        if not self.insight_store:
-            files_processed = collection_result.get("files_processed", 0)
-            print(f"Warning: No insights found in {files_processed} collected files!")
-            return {
-                "error": "No insights found",
-                "files_processed": files_processed,
-                "collection_result": collection_result,
-                "aggregation_steps": self.aggregation_steps,
-            }
+        self._validate_reasoning_traces(self.insight_store)
 
         # Step 2: Text-Based Profiling
         print("\n" + "=" * 80)
         print("STEP 2: Text-Based Profiling of insight Relationships")
         print("=" * 80)
-        profiling_result = self._step_text_profiling(self.insight_store)
+        profiling_fingerprint_payload = {
+            "insight_store": self.insight_store,
+            "use_api": self.use_api,
+            "api_provider": getattr(self, "api_provider", None),
+            "api_model": getattr(self, "api_model_name", None),
+            "model_name": getattr(self, "model_name", None),
+            "custom_prompt_section": getattr(self, "custom_prompt_section", ""),
+        }
+        profiling_fingerprint = hashlib.sha256(
+            json.dumps(
+                profiling_fingerprint_payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        profiling_path = Path(output_dir) / "profiling.json"
+        profiling_checkpoint_path = Path(output_dir) / "profiling_checkpoint.json"
+        saved_profiling = None
+        saved_profiling_checkpoint = None
+        saved_profiling_sha256 = None
+        if profiling_path.exists() and profiling_checkpoint_path.exists():
+            try:
+                saved_profiling = json.loads(
+                    profiling_path.read_text(encoding="utf-8")
+                )
+                saved_profiling_checkpoint = json.loads(
+                    profiling_checkpoint_path.read_text(encoding="utf-8")
+                )
+                self._validate_profiling(saved_profiling)
+                saved_profiling_sha256 = hashlib.sha256(
+                    json.dumps(
+                        saved_profiling,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            except Exception:
+                saved_profiling = None
+                saved_profiling_checkpoint = None
+                saved_profiling_sha256 = None
+
+        if (
+            isinstance(saved_profiling_checkpoint, dict)
+            and saved_profiling_checkpoint.get("version") == 1
+            and saved_profiling_checkpoint.get("insight_store_sha256")
+            == profiling_fingerprint
+            and saved_profiling_checkpoint.get("profiling_sha256")
+            == saved_profiling_sha256
+            and isinstance(saved_profiling, dict)
+        ):
+            self.insight_relationships = saved_profiling
+            profiling_result = {
+                "step": 2,
+                "name": "Text-Based Profiling",
+                "profiling": self.insight_relationships,
+                "output_tokens": int(
+                    saved_profiling_checkpoint.get("output_tokens", 0) or 0
+                ),
+                "resumed": True,
+                "timestamp": time.time(),
+            }
+            self.aggregation_steps.append(profiling_result)
+            print(
+                "Profiling checkpoint matches the collected insights; "
+                "reusing saved clusters and relationships"
+            )
+        else:
+            profiling_result = self._step_text_profiling(
+                self.insight_store, output_dir=output_dir
+            )
+            self.save_profiling(
+                {"insight_relationships": self.insight_relationships},
+                output_dir=output_dir,
+            )
+            profiling_checkpoint = {
+                "version": 1,
+                "insight_store_sha256": profiling_fingerprint,
+                "profiling_sha256": hashlib.sha256(
+                    json.dumps(
+                        self.insight_relationships,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "output_tokens": int(profiling_result.get("output_tokens", 0) or 0),
+            }
+            profiling_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = profiling_checkpoint_path.with_name(
+                f".{profiling_checkpoint_path.name}.tmp"
+            )
+            temporary.write_text(
+                json.dumps(profiling_checkpoint, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, profiling_checkpoint_path)
         time.sleep(1)
 
         # Step 3: Knowledge Extraction
@@ -818,7 +1338,7 @@ Output aggregated insight:
         return result
 
     def save_results(self, result: Dict, output_dir: str = "math_output"):
-        """Save only encyclopedia.json with format {"insight_name": "description"}"""
+        """Save the insight library and its cluster/relationship profiling."""
         os.makedirs(output_dir, exist_ok=True)
         encyclopedia_path = os.path.join(output_dir, "encyclopedia.json")
 
@@ -835,9 +1355,34 @@ Output aggregated insight:
             print(error_msg)
             raise ValueError(error_msg)
 
+        self._validate_insight_library(encyclopedia_dict)
+
         with open(encyclopedia_path, "w", encoding="utf-8") as f:
             json.dump(encyclopedia_dict, f, indent=2, ensure_ascii=False)
         print(f"Encyclopedia saved to: {encyclopedia_path}")
+
+        self.save_profiling(result, output_dir=output_dir)
+
+    def save_profiling(
+        self,
+        result: Dict,
+        output_dir: str = "math_output",
+        filename: str = "profiling.json",
+    ) -> str:
+        """Persist the complete Prompt-4 cluster and relationship result."""
+        profiling = result.get("insight_relationships")
+        if profiling is None and isinstance(result.get("profiling"), dict):
+            profiling = result["profiling"].get("profiling")
+        self._validate_profiling(profiling)
+
+        os.makedirs(output_dir, exist_ok=True)
+        profiling_path = os.path.join(output_dir, filename)
+        temporary_path = os.path.join(output_dir, f".{filename}.tmp")
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(profiling, f, indent=2, ensure_ascii=False)
+        os.replace(temporary_path, profiling_path)
+        print(f"Cluster and relationship profiling saved to: {profiling_path}")
+        return profiling_path
 
 
 if __name__ == "__main__":
@@ -892,6 +1437,12 @@ if __name__ == "__main__":
         help="API key for the chosen provider (or set GEMINI_API_KEY / OPENROUTER_API_KEY env var)",
     )
     parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help="Provider model name, e.g. google/gemini-2.5-flash-lite on OpenRouter.",
+    )
+    parser.add_argument(
         "--num-insights",
         type=int,
         default=None,
@@ -920,6 +1471,7 @@ if __name__ == "__main__":
         use_api=args.use_api,
         api_key=args.api_key,
         api_provider=args.api_provider,
+        api_model=args.api_model,
         num_insights=args.num_insights,
         max_files=args.max_files,
         seed=args.seed,
