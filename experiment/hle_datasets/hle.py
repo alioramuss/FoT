@@ -45,8 +45,8 @@ def _decode_data_uri_image(data_uri: str) -> Optional[Image.Image]:
     _, payload = data_uri.split(",", 1)
     try:
         image_bytes = base64.b64decode(payload)
-        image = Image.open(io.BytesIO(image_bytes))
-        return image.convert("RGB")
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            return image.convert("RGB")
     except (binascii.Error, ValueError, OSError):
         return None
 
@@ -56,19 +56,37 @@ def extract_hle_image(example: Dict[str, Any]) -> Tuple[Optional[Image.Image], s
 
     Preferred order:
       1) `image_preview` (already decoded by datasets)
-      2) `rationale_image` (decoded image, if present)
-      3) `image` base64 data URI string
+      2) `image` base64 data URI string
+
+    `rationale_image` is deliberately excluded because it is answer-side
+    rationale material rather than part of the question input.
 
     Returns:
         (image_or_none, source_label)
     """
-    image_preview = example.get("image_preview")
-    if isinstance(image_preview, Image.Image):
-        return image_preview.convert("RGB"), "image_preview"
+    def decode_image_field(value: Any) -> Optional[Image.Image]:
+        if isinstance(value, Image.Image):
+            return value.convert("RGB")
+        if isinstance(value, dict):
+            raw_bytes = value.get("bytes")
+            if raw_bytes:
+                try:
+                    with Image.open(io.BytesIO(raw_bytes)) as image:
+                        return image.convert("RGB")
+                except (ValueError, OSError):
+                    return None
+            image_path = value.get("path")
+            if image_path:
+                try:
+                    with Image.open(image_path) as image:
+                        return image.convert("RGB")
+                except (ValueError, OSError):
+                    return None
+        return None
 
-    rationale_image = example.get("rationale_image")
-    if isinstance(rationale_image, Image.Image):
-        return rationale_image.convert("RGB"), "rationale_image"
+    image_preview = decode_image_field(example.get("image_preview"))
+    if image_preview is not None:
+        return image_preview, "image_preview"
 
     image_data_uri = example.get("image")
     decoded = _decode_data_uri_image(image_data_uri)

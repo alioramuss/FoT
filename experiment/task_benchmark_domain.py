@@ -10,9 +10,11 @@ Usage is similar to math_pipeline.py but adds list-style arguments.
 
 ### Hugging Face Datasets (via 🤗 datasets library):
 - gsm8k, gsm8k_train: Grade School Math (8K examples)
-- aime24, aime25: American Invitational Mathematics Examination
+- aime24, aime25, aime26: American Invitational Mathematics Examination
 - math500, math1000: Competition math problems
 - gpqa, gpqa_diamond: Graduate-level science problems (GPQA benchmark)
+- hle: Full text and image questions from Humanity's Last Exam (gated on Hugging Face)
+- livecodebench_v6: Cumulative LiveCodeBench release v6
 
 ### Local Datasets:
 - CSV or JSON files in math_datasets/ directory
@@ -64,10 +66,17 @@ import os
 import random
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import parallel_utils
+from utils import (
+    OpenRouterInFlightBudgetError,
+    is_openrouter_budget_error,
+    normalize_api_model,
+)
 
 try:
     from datasets import load_dataset
@@ -83,8 +92,14 @@ from client_ace import ACEClient
 from math_datasets.imo_benchmark import imo_evaluator
 from math_datasets.livemathbench import livemathbench_evaluator
 from math_datasets.utils import extract_numbers
-from server import InsightAggregationServer
 from server_text import TextBasedInsightAggregationServer
+
+try:
+    from server import InsightAggregationServer as _InsightAggregationServer
+    _GRAPH_SERVER_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:
+    _InsightAggregationServer = None
+    _GRAPH_SERVER_IMPORT_ERROR = exc
 
 # Dataset registry: (source, path_or_hf_name, data_dir_or_col_map, split_or_none)
 # - source="hf": use Hugging Face with (hf_name, data_dir, split)
@@ -116,14 +131,24 @@ DATASET_REGISTRY: Dict[str, Tuple[str, str, Optional[str], Optional[str]]] = {
     "gsm8k_train": ("hf", "openai/gsm8k", "main", "train"),
     "aime25": ("hf", "math-ai/aime25", None, "test"),
     "aime24": ("hf", "math-ai/aime24", None, "test"),
+    "aime26": ("hf", "math-ai/aime26", None, "test"),
     "math500": ("hf", "HuggingFaceH4/MATH-500", None, "test"),
     "math1000": ("hf", "hendrycks/competition_math", None, "test"),
     # GPQA datasets (Graduate-level science problems)
     "gpqa": ("hf", "Idavidrein/gpqa", "gpqa_main", "train"),
     "gpqa_diamond": ("hf", "Idavidrein/gpqa", "gpqa_diamond", "train"),
+    # HLE is multimodal; image fields are attached through the OpenRouter
+    # solution-generation path while the text fields remain intact.
+    "hle": ("hf", "cais/hle", None, "test"),
     # LiveCodeBench datasets (Code generation)
     # Using bzantium/livecodebench (Parquet-based clone, works with datasets 3.0+)
     "livecodebench": ("hf", "bzantium/livecodebench", "release_v6", "test"),
+    "livecodebench_v6": (
+        "hf",
+        "bzantium/livecodebench",
+        "release_v6",
+        "test",
+    ),
     "livecodebench_lite": ("hf", "bzantium/livecodebench", "v6", "test"),  # Latest version increment
     # LiveMathBench datasets (OpenCompass)
     "livemathbench_amc": ("hf", "opencompass/LiveMathBench", "v202412_AMC_en", "test"),
@@ -187,6 +212,8 @@ def _build_client(
     api_provider: str,
     output_dir: str,
     load_in_8bit: bool,
+    api_model: Optional[str] = None,
+    reasoning_enabled: Optional[bool] = None,
 ):
     """Factory: return the requested client instance."""
     common = dict(
@@ -199,24 +226,246 @@ def _build_client(
         load_in_8bit=load_in_8bit,
     )
     if client_type == "metacognitive":
-        return MetacognitiveClient(**common)
+        client = MetacognitiveClient(**common)
     elif client_type == "trt":
-        return TRTClient(**common)
+        client = TRTClient(
+            **common, **({"api_model": api_model} if api_model else {})
+        )
     elif client_type == "hyperagents":
-        return HyperAgentsClient(**common)
+        client = HyperAgentsClient(**common)
     elif client_type == "evolveprompt":
-        return EvolvePromptClient(**common)
+        client = EvolvePromptClient(**common)
     elif client_type == "ace":
-        return ACEClient(**common)
+        client = ACEClient(
+            **common, **({"api_model": api_model} if api_model else {})
+        )
     else:  # "default"
-        return ChainOfThoughtReader(
+        client = ChainOfThoughtReader(
             model_name=model_name,
             device=device,
             use_api=use_api,
             api_key=api_key,
             api_provider=api_provider,
+            api_model=api_model,
+            reasoning_enabled=reasoning_enabled,
             load_in_8bit=load_in_8bit,
         )
+    if use_api:
+        client.api_model_name = normalize_api_model(api_provider, api_model)
+    return client
+
+
+_BENCHMARK_PROCESS_PIPELINE = None
+_BENCHMARK_PROCESS_CLIENT = None
+_BENCHMARK_PROCESS_CONFIG: Optional[Dict[str, Any]] = None
+
+
+def _initialize_benchmark_process(config: Dict[str, Any]) -> None:
+    """Create one pipeline helper and one API client in each worker process."""
+    global _BENCHMARK_PROCESS_PIPELINE
+    global _BENCHMARK_PROCESS_CLIENT
+    global _BENCHMARK_PROCESS_CONFIG
+
+    _BENCHMARK_PROCESS_CONFIG = config
+    _BENCHMARK_PROCESS_PIPELINE = BenchmarkDomainPipeline(
+        model_name=config["model_name"],
+        device=config["device"],
+        output_dir=config["output_dir"],
+        use_api=config["use_api"],
+        api_key=config["api_key"],
+        api_provider=config["api_provider"],
+        mode=config["mode"],
+        num_iterations=1,
+        load_in_8bit=config["load_in_8bit"],
+        client_type=config["client_type"],
+        api_model=config["api_model"],
+        reasoning_enabled=config["reasoning_enabled"],
+        num_workers=1,
+    )
+    _BENCHMARK_PROCESS_CLIENT = _build_client(
+        client_type=config["client_type"],
+        model_name=config["model_name"],
+        device=config["device"],
+        use_api=config["use_api"],
+        api_key=config["api_key"],
+        api_provider=config["api_provider"],
+        output_dir=config["output_dir"],
+        load_in_8bit=config["load_in_8bit"],
+        api_model=config["api_model"],
+        reasoning_enabled=config["reasoning_enabled"],
+    )
+    print(
+        f"[API worker pid={os.getpid()}] initialized "
+        f"{config['client_type']} client for {config['dataset_name']}",
+        flush=True,
+    )
+
+
+def _solve_benchmark_problem_process(item):
+    """Solve and extract insights inside one process-local API agent."""
+    if (
+        _BENCHMARK_PROCESS_PIPELINE is None
+        or _BENCHMARK_PROCESS_CLIENT is None
+        or _BENCHMARK_PROCESS_CONFIG is None
+    ):
+        raise RuntimeError("Benchmark process worker was not initialized")
+
+    idx, problem_data = item
+    pipeline = _BENCHMARK_PROCESS_PIPELINE
+    task_client = _BENCHMARK_PROCESS_CLIENT
+    config = _BENCHMARK_PROCESS_CONFIG
+    dataset_name = config["dataset_name"]
+    problem_text, test_cases = pipeline._format_problem(problem_data, dataset_name)
+    if not problem_text:
+        return problem_text, test_cases, None, None, "missing", os.getpid()
+
+    image = None
+    image_source = "none"
+    if dataset_name == "hle":
+        from hle_datasets.hle import extract_hle_image
+
+        image, image_source = extract_hle_image(problem_data)
+    try:
+        if image is not None and not isinstance(task_client, ChainOfThoughtReader):
+            raise ValueError(
+                "Multimodal HLE insight generation currently requires --client default."
+            )
+        result = task_client.solve_problem(
+            task=problem_text,
+            insights_section=config["insights_section"],
+            **({"image": image} if image is not None else {}),
+        )
+        return problem_text, test_cases, result, None, image_source, os.getpid()
+    except OpenRouterInFlightBudgetError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if is_openrouter_budget_error(exc):
+            raise OpenRouterInFlightBudgetError(
+                "OpenRouter rejected the benchmark request because the account "
+                "budget cannot admit it. Stopping this run immediately; completed "
+                "checkpoints remain resumable."
+            ) from exc
+        error = RuntimeError(f"{type(exc).__name__}: {exc}")
+        return problem_text, test_cases, None, error, image_source, os.getpid()
+    finally:
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
+def _evaluate_benchmark_problem_process(item):
+    """Evaluate one problem and atomically checkpoint it in a worker process."""
+    if (
+        _BENCHMARK_PROCESS_PIPELINE is None
+        or _BENCHMARK_PROCESS_CLIENT is None
+        or _BENCHMARK_PROCESS_CONFIG is None
+    ):
+        raise RuntimeError("Benchmark process worker was not initialized")
+
+    idx, problem_data = item
+    pipeline = _BENCHMARK_PROCESS_PIPELINE
+    task_client = _BENCHMARK_PROCESS_CLIENT
+    config = _BENCHMARK_PROCESS_CONFIG
+    dataset_name = config["dataset_name"]
+    problem_text, test_cases_for_eval = pipeline._format_problem(
+        problem_data, dataset_name
+    )
+    if not problem_text:
+        return {"index": idx, "skip": True, "worker_pid": os.getpid()}
+
+    image = None
+    image_source = "none"
+    if dataset_name == "hle":
+        from hle_datasets.hle import extract_hle_image
+
+        image, image_source = extract_hle_image(problem_data)
+    try:
+        if image is not None and not isinstance(task_client, ChainOfThoughtReader):
+            raise ValueError(
+                "Multimodal HLE evaluation currently requires --client default."
+            )
+        prompt = task_client._get_solution_prompt(
+            problem_text, insights_section=config["insights_section"]
+        )
+        if image is not None:
+            prompt = (
+                "An image is attached to this problem. Use both the image "
+                "and the question text; do not ignore visual evidence.\n\n" + prompt
+            )
+        response, token_info = task_client._call_model(
+            prompt,
+            None,
+            max_new_tokens=config["eval_max_output_tokens"],
+            **({"image": image} if image is not None else {}),
+        )
+        solution = response
+        number_output_tokens = token_info.get("output_tokens", 0)
+        number_reasoning_tokens = token_info.get("reasoning_tokens", 0)
+        loop_count = pipeline._count_consecutive_sentence_loops(solution)
+        predicted_answer = pipeline._extract_answer_from_solution(
+            solution, dataset_name, problem_data
+        )
+        if test_cases_for_eval:
+            is_correct = pipeline._check_answer_match(
+                solution, test_cases_for_eval, dataset_name, problem_text
+            )
+            ground_truth = None
+        else:
+            ground_truth = pipeline._get_ground_truth(problem_data, dataset_name)
+            is_correct = False
+            if predicted_answer:
+                is_correct = pipeline._check_answer_match(
+                    predicted_answer, ground_truth, dataset_name, problem_text
+                )
+        output_data = {
+            "problem": problem_text,
+            "problem_id": problem_data.get("id", idx),
+            "solution": solution,
+            "predicted_answer": predicted_answer,
+            "is_correct": is_correct,
+            "number_output_tokens": number_output_tokens,
+            "number_reasoning_tokens": number_reasoning_tokens,
+            "loop_count": loop_count,
+            "multimodal_image_source": image_source,
+            "worker_pid": os.getpid(),
+        }
+        output_path = os.path.join(config["eval_dir"], f"problem_{idx:04d}.json")
+        temporary_path = f"{output_path}.tmp.{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(output_data, handle, indent=2, ensure_ascii=False)
+        os.replace(temporary_path, output_path)
+        return {
+            "index": idx,
+            "output_data": output_data,
+            "ground_truth": ground_truth,
+            "test_cases": bool(test_cases_for_eval),
+            "is_correct": is_correct,
+            "number_output_tokens": number_output_tokens,
+            "loop_count": loop_count,
+            "worker_pid": os.getpid(),
+        }
+    except OpenRouterInFlightBudgetError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if is_openrouter_budget_error(exc):
+            raise OpenRouterInFlightBudgetError(
+                "OpenRouter rejected the benchmark request because the account "
+                "budget cannot admit it. Stopping this run immediately; completed "
+                "checkpoints remain resumable."
+            ) from exc
+        return {
+            "index": idx,
+            "error": f"{type(exc).__name__}: {exc}",
+            "worker_pid": os.getpid(),
+        }
+    finally:
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
 
 
 class BenchmarkDomainPipeline:
@@ -232,6 +481,9 @@ class BenchmarkDomainPipeline:
         num_iterations: int = 3,
         load_in_8bit: bool = False,
         client_type: str = "default",
+        api_model: Optional[str] = None,
+        reasoning_enabled: Optional[bool] = None,
+        num_workers: int = parallel_utils.DEFAULT_NUM_WORKERS,
     ):
         self.model_name = model_name
         self.device = device
@@ -239,18 +491,65 @@ class BenchmarkDomainPipeline:
         self.use_api = use_api
         self.api_key = api_key
         self.api_provider = api_provider
+        self.api_model = (
+            normalize_api_model(api_provider, api_model) if api_model else None
+        )
+        self.reasoning_enabled = reasoning_enabled
         self.mode = mode  # "normal" uses server.py, "text" uses server_text.py
         self.iterative = True  # Always True
         self.num_iterations = num_iterations
         self.load_in_8bit = load_in_8bit
         self.client_type = client_type
+        self.num_workers = parallel_utils.worker_count(num_workers)
 
         os.makedirs(output_dir, exist_ok=True)
 
         self.client = None
-        self.server: Optional[InsightAggregationServer] = None
+        self.server: Optional[Any] = None
         self.server_text: Optional[TextBasedInsightAggregationServer] = None
         self.encyclopedia_loaded = False
+
+    def _process_config(
+        self,
+        dataset_name: str,
+        insights_section: str,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        """Return only serializable state needed by spawned API workers."""
+        config = {
+            "client_type": self.client_type,
+            "model_name": self.model_name,
+            "device": self.device,
+            "use_api": self.use_api,
+            "api_key": self.api_key,
+            "api_provider": self.api_provider,
+            "api_model": self.api_model,
+            "reasoning_enabled": self.reasoning_enabled,
+            "output_dir": self.output_dir,
+            "load_in_8bit": self.load_in_8bit,
+            "mode": self.mode,
+            "dataset_name": dataset_name,
+            "insights_section": insights_section,
+        }
+        config.update(extra)
+        return config
+
+    def _create_graph_server(self):
+        """Construct the optional GraphRAG server only when normal mode needs it."""
+        if _InsightAggregationServer is None:
+            raise ImportError(
+                "--mode normal requires optional GraphRAG dependencies such as "
+                "sentence_transformers. Use --mode text or install those dependencies."
+            ) from _GRAPH_SERVER_IMPORT_ERROR
+        return _InsightAggregationServer(
+            model_name=self.model_name,
+            device=self.device,
+            input_dir=self.output_dir,
+            use_api=self.use_api,
+            api_key=self.api_key,
+            api_provider=self.api_provider,
+            api_model=self.api_model,
+        )
 
     def _count_consecutive_sentence_loops(self, text: str) -> int:
         """Count repeated consecutive sentences in the generated text.
@@ -468,8 +767,16 @@ class BenchmarkDomainPipeline:
                 if dataset_name == "math1000" and i >= 1000:
                     break
 
+                # Preserve every HLE row, including decoded and data-URI image
+                # fields. Images are attached to the solution-generation call.
+                if dataset_name == "hle":
+                    raw_item = dict(item)
+                    raw_item["id"] = item.get("id", i + 1)
+                    raw_item["problem"] = item.get("question", "")
+                    raw_item["question"] = item.get("question", "")
+                    raw.append(raw_item)
                 # For GPQA datasets, preserve all original fields
-                if dataset_name and dataset_name.startswith("gpqa"):
+                elif dataset_name and dataset_name.startswith("gpqa"):
                     # Keep all original fields for GPQA (Question, Correct Answer, Incorrect Answer 1/2/3)
                     raw_item = dict(item)
                     raw_item["id"] = item.get("id", i + 1)
@@ -503,7 +810,11 @@ class BenchmarkDomainPipeline:
                     )
             print(f"Loaded {len(raw)} problems from Hugging Face")
             # Skip normalization for GPQA and LiveCodeBench datasets to preserve original field structure
-            if dataset_name and (dataset_name.startswith("gpqa") or dataset_name.startswith("livecodebench")):
+            if dataset_name and (
+                dataset_name == "hle"
+                or dataset_name.startswith("gpqa")
+                or dataset_name.startswith("livecodebench")
+            ):
                 return raw
             return self._normalize_problems(raw, dataset_name)
 
@@ -535,8 +846,20 @@ class BenchmarkDomainPipeline:
                 api_provider=self.api_provider,
                 output_dir=self.output_dir,
                 load_in_8bit=self.load_in_8bit,
+                api_model=self.api_model,
+                reasoning_enabled=self.reasoning_enabled,
             )
             print(f"[Pipeline] Using client: {self.client_type} ({type(self.client).__name__})")
+
+    def _clear_client_encyclopedia(self) -> None:
+        """Clear loaded encyclopedia state on the reusable client."""
+        self._ensure_client()
+        if hasattr(self.client, "encyclopedia"):
+            self.client.encyclopedia = ""
+        if hasattr(self.client, "encyclopedia_dict"):
+            self.client.encyclopedia_dict = {}
+        if hasattr(self.client, "encyclopedia_loaded"):
+            self.client.encyclopedia_loaded = False
 
     def _extract_insights_for_dataset(
         self,
@@ -600,68 +923,103 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
 """
             else:
                 print("  No valid encyclopedias found; proceeding without guidance")
+                self._clear_client_encyclopedia()
+        else:
+            self._clear_client_encyclopedia()
 
         results = []
         number_output_tokens_list = []
         loop_count_list = []
+        indexed_problems = list(enumerate(worklist, 1))
+        parallel_clients = self.use_api and self.num_workers > 1
 
-        for idx, problem_data in enumerate(worklist, 1):
-            # Use dataset-specific formatter if available
-            problem_text = None
-            test_cases_for_eval = None  # Special for code generation datasets
-            if dataset_name == "aime25":
-                from math_datasets.aime25 import aime25_formatter
+        def solve_one(item):
+            idx, problem_data = item
+            problem_text, test_cases = self._format_problem(problem_data, dataset_name)
+            if not problem_text:
+                return problem_text, test_cases, None, None, "missing", os.getpid()
+            image = None
+            image_source = "none"
+            if dataset_name == "hle":
+                from hle_datasets.hle import extract_hle_image
 
-                problem_text, _ = aime25_formatter(problem_data)
-            elif dataset_name == "aime24":
-                # AIME24 uses same format as AIME25
-                from math_datasets.aime25 import aime25_formatter
-
-                problem_text, _ = aime25_formatter(problem_data)
-            elif dataset_name and "livemathbench" in dataset_name:
-                from math_datasets.livemathbench import livemathbench_formatter
-
-                problem_text, _ = livemathbench_formatter(problem_data, dataset_name)
-            elif dataset_name and dataset_name.startswith("imo"):
-                from math_datasets.imo_benchmark import imo_formatter
-
-                problem_text, _ = imo_formatter(problem_data, dataset_name)
-            elif dataset_name == "math500":
-                from math_datasets.math500 import math500_formatter
-
-                problem_text, _ = math500_formatter(problem_data)
-            elif dataset_name == "gsm8k":
-                from math_datasets.gsm8k import gsm8k_formatter
-
-                problem_text, _ = gsm8k_formatter(problem_data)
-            elif dataset_name and dataset_name.startswith("gpqa"):
-                from science_datasets.gpqa import gpqa_formatter
-
-                problem_text, _ = gpqa_formatter(problem_data)
-            elif dataset_name and "livecodebench" in dataset_name:
-                from code_datasets.livecodebench import livecodebench_formatter
-
-                problem_text, test_cases_for_eval = livecodebench_formatter(problem_data)
-            else:
-                # Fallback: extract raw problem text
-                problem_text = problem_data.get("problem") or problem_data.get(
-                    "question", ""
+                image, image_source = extract_hle_image(problem_data)
+            task_client = self.client
+            try:
+                if image is not None and not isinstance(task_client, ChainOfThoughtReader):
+                    raise ValueError(
+                        "Multimodal HLE insight generation currently requires "
+                        "--client default."
+                    )
+                result = task_client.solve_problem(
+                    task=problem_text,
+                    insights_section=insights_section,
+                    **({"image": image} if image is not None else {}),
                 )
+                return problem_text, test_cases, result, None, image_source, os.getpid()
+            except OpenRouterInFlightBudgetError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if is_openrouter_budget_error(exc):
+                    raise OpenRouterInFlightBudgetError(
+                        "OpenRouter rejected the benchmark request because the "
+                        "account budget cannot admit it. Stopping this run "
+                        "immediately; completed checkpoints remain resumable."
+                    ) from exc
+                return problem_text, test_cases, None, exc, image_source, os.getpid()
+            finally:
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
+
+        workers = self.num_workers if parallel_clients else 1
+        if parallel_clients:
+            print(
+                f"  Launching {min(workers, len(indexed_problems))} independent "
+                "API agent process(es) for insight extraction"
+            )
+            solve_outcomes = parallel_utils.process_map_ordered(
+                _solve_benchmark_problem_process,
+                indexed_problems,
+                num_workers=workers,
+                initializer=_initialize_benchmark_process,
+                initargs=(
+                    self._process_config(dataset_name, insights_section),
+                ),
+            )
+        else:
+            solve_outcomes = parallel_utils.parallel_map_ordered(
+                solve_one, indexed_problems, num_workers=1
+            )
+
+        for (idx, problem_data), outcome in zip(indexed_problems, solve_outcomes):
+            (
+                problem_text,
+                test_cases_for_eval,
+                solved_result,
+                solve_error,
+                image_source,
+                worker_pid,
+            ) = outcome
 
             if not problem_text:
                 print(f"  [skip] Problem {idx} missing text")
                 continue
 
-            print(f"  [{idx}/{len(worklist)}] {problem_text[:80]}...")
+            print(
+                f"  [{idx}/{len(worklist)}] [pid={worker_pid}] "
+                f"{problem_text[:80]}..."
+            )
 
             # Extract solution, reflection, and insights in one call
             predicted_answer = None
             is_correct = False
             try:
-                result = self.client.solve_problem(
-                    task=problem_text,
-                    insights_section=insights_section,
-                )
+                if solve_error is not None:
+                    raise solve_error
+                result = solved_result or {}
 
                 # Extract solution first
                 solution = result.get("solution", "")
@@ -736,6 +1094,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                     "is_correct": is_correct,
                     "number_output_tokens": number_output_tokens,
                     "loop_count": loop_count,
+                    "multimodal_image_source": image_source,
                 }
 
                 output_path = os.path.join(insights_dir, f"problem_{idx:04d}.json")
@@ -748,6 +1107,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                         "is_correct": is_correct,
                         "number_output_tokens": number_output_tokens,
                         "loop_count": loop_count,
+                        "multimodal_image_source": image_source,
                     }
                 )
                 time.sleep(0.5)
@@ -834,7 +1194,9 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 "dataset": name,
                 "accuracy": accuracy_map[name],
                 "model": (
-                    "gemini-3-pro-preview" if self.use_api else self.model_name
+                    self.api_model
+                    if self.use_api and self.api_model
+                    else self.model_name
                 ),
                 "encyclopedia_used": [
                     ep for ep in (encyclopedia_paths or []) if ep and os.path.exists(ep)
@@ -842,6 +1204,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 "average_output_tokens": token_map.get(name, 0.0),
                 "total_loop_count": loop_map.get(name, 0.0),
                 "question_correctness": question_correctness,
+                "max_problems": max_problems,
             }
             try:
                 if os.path.exists(summary_file):
@@ -869,7 +1232,11 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
     # STEP 2: Aggregate chosen insights into one encyclopedia
     # ------------------------------------------------------------------
     def aggregate_insights(
-        self, insight_sets: List[str], r1: float, r2: float
+        self,
+        insight_sets: List[str],
+        r1: float,
+        r2: float,
+        iteration: Optional[int] = None,
     ) -> Dict[str, str]:
         if not insight_sets:
             raise ValueError("Provide at least one dataset to aggregate in STEP 2.")
@@ -901,21 +1268,22 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                     use_api=self.use_api,
                     api_key=self.api_key,
                     api_provider=self.api_provider,
+                    api_model=self.api_model,
+                    reasoning_enabled=self.reasoning_enabled,
                 )
                 result = self.server_text.aggregate_and_build_encyclopedia(
                     json_files=dataset_files, output_dir=insights_dir
                 )
                 self.server_text.save_results(result, output_dir=insights_dir)
+                if iteration is not None:
+                    self.server_text.save_profiling(
+                        result,
+                        output_dir=insights_dir,
+                        filename=f"profiling_iter_{iteration:02d}.json",
+                    )
                 encyclopedia_path = os.path.join(insights_dir, "encyclopedia.json")
             else:
-                self.server = InsightAggregationServer(
-                    model_name=self.model_name,
-                    device=self.device,
-                    input_dir=self.output_dir,
-                    use_api=self.use_api,
-                    api_key=self.api_key,
-                    api_provider=self.api_provider,
-                )
+                self.server = self._create_graph_server()
                 result = self.server.aggregate_and_build_encyclopedia(
                     json_files=dataset_files, r1=r1, r2=r2, output_dir=insights_dir
                 )
@@ -923,12 +1291,92 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 encyclopedia_path = os.path.join(insights_dir, "encyclopedia.txt")
 
             print(f"    Encyclopedia saved to {encyclopedia_path}")
-            per_dataset_encyclopedias[name] = encyclopedia_path
+            per_dataset_encyclopedias[name] = os.path.abspath(encyclopedia_path)
 
         return per_dataset_encyclopedias
 
+    def _dataset_encyclopedia_path(self, dataset_name: str) -> str:
+        if self.mode == "text":
+            filename = "encyclopedia.json"
+        else:
+            filename = "encyclopedia.txt"
+        return os.path.join(self.output_dir, dataset_name, filename)
+
+    def _iteration_encyclopedia_path(self, iteration: int) -> str:
+        extension = "json" if self.mode == "text" else "txt"
+        return os.path.join(
+            self.output_dir,
+            f"encyclopedia_all_iter_{iteration:02d}.{extension}",
+        )
+
+    def _resumable_extraction_accuracy(
+        self, iteration: int, dataset_list: List[str], max_problems: Optional[int]
+    ) -> Optional[Dict[str, float]]:
+        """Recover a completed Step 1 when aggregation failed afterward."""
+        summary_path = Path(self.output_dir, "iterative_summary.json")
+        if not summary_path.is_file():
+            return None
+        try:
+            entries = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        accuracy_map: Dict[str, float] = {}
+        for dataset_name in dataset_list:
+            matches = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict)
+                and entry.get("iteration") == iteration
+                and entry.get("dataset") == dataset_name
+                and entry.get("model")
+                == (
+                    self.api_model
+                    if self.use_api and self.api_model
+                    else self.model_name
+                )
+                and entry.get("max_problems", max_problems) == max_problems
+            ]
+            if not matches:
+                return None
+
+            insights_dir = Path(self.output_dir, dataset_name)
+            problem_files = sorted(insights_dir.glob("problem_*.json"))
+            has_current_iteration = False
+            for problem_file in problem_files:
+                try:
+                    problem_result = json.loads(
+                        problem_file.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError, TypeError):
+                    continue
+                if problem_result.get("iteration") == iteration:
+                    has_current_iteration = True
+                    break
+            if not has_current_iteration:
+                return None
+            accuracy_map[dataset_name] = float(matches[-1].get("accuracy", 0.0))
+
+        return accuracy_map
+
+    def _find_existing_individual_encyclopedias(
+        self, dataset_list: List[str]
+    ) -> Dict[str, List[str]]:
+        encyclopedia_map: Dict[str, List[str]] = {}
+        for dataset_name in dataset_list:
+            dataset_ency = self._dataset_encyclopedia_path(dataset_name)
+            if os.path.exists(dataset_ency):
+                encyclopedia_map[dataset_name] = [os.path.abspath(dataset_ency)]
+        return encyclopedia_map
+
     def generate_combined_encyclopedia(
-        self, dataset_list: List[str], r1: float = 0.95, r2: float = 0.4
+        self,
+        dataset_list: List[str],
+        r1: float = 0.95,
+        r2: float = 0.4,
+        iteration: Optional[int] = None,
     ) -> Optional[str]:
         """Generate a combined encyclopedia from all problem_*.json files across all datasets.
 
@@ -979,6 +1427,8 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 use_api=self.use_api,
                 api_key=self.api_key,
                 api_provider=self.api_provider,
+                api_model=self.api_model,
+                reasoning_enabled=self.reasoning_enabled,
             )
             result = self.server_text.aggregate_and_build_encyclopedia(
                 json_files=all_json_files, output_dir=self.output_dir
@@ -995,15 +1445,31 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 raise ValueError(error_msg)
             with open(encyclopedia_all_path, "w", encoding="utf-8") as f:
                 json.dump(encyclopedia_dict, f, indent=2, ensure_ascii=False)
-        else:
-            self.server = InsightAggregationServer(
-                model_name=self.model_name,
-                device=self.device,
-                input_dir=self.output_dir,
-                use_api=self.use_api,
-                api_key=self.api_key,
-                api_provider=self.api_provider,
+            if iteration is not None:
+                iteration_encyclopedia_path = self._iteration_encyclopedia_path(
+                    iteration
+                )
+                with open(
+                    iteration_encyclopedia_path, "w", encoding="utf-8"
+                ) as f:
+                    json.dump(encyclopedia_dict, f, indent=2, ensure_ascii=False)
+                print(
+                    "Iteration encyclopedia snapshot saved to: "
+                    f"{iteration_encyclopedia_path}"
+                )
+            self.server_text.save_profiling(
+                result,
+                output_dir=self.output_dir,
+                filename="profiling_all.json",
             )
+            if iteration is not None:
+                self.server_text.save_profiling(
+                    result,
+                    output_dir=self.output_dir,
+                    filename=f"profiling_all_iter_{iteration:02d}.json",
+                )
+        else:
+            self.server = self._create_graph_server()
             result = self.server.aggregate_and_build_encyclopedia(
                 json_files=all_json_files, r1=r1, r2=r2, output_dir=self.output_dir
             )
@@ -1011,6 +1477,18 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             encyclopedia_all_path = os.path.join(self.output_dir, "encyclopedia_all.txt")
             with open(encyclopedia_all_path, "w", encoding="utf-8") as f:
                 f.write(self.server.encyclopedia)
+            if iteration is not None:
+                iteration_encyclopedia_path = self._iteration_encyclopedia_path(
+                    iteration
+                )
+                with open(
+                    iteration_encyclopedia_path, "w", encoding="utf-8"
+                ) as f:
+                    f.write(self.server.encyclopedia)
+                print(
+                    "Iteration encyclopedia snapshot saved to: "
+                    f"{iteration_encyclopedia_path}"
+                )
 
         print(f"\nCombined encyclopedia saved to: {encyclopedia_all_path}")
         return encyclopedia_all_path
@@ -1022,10 +1500,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         """Format a problem for the given dataset. Returns (problem_text, test_cases_for_eval)."""
         problem_text = None
         test_cases_for_eval = None
-        if dataset_name == "aime25":
-            from math_datasets.aime25 import aime25_formatter
-            problem_text, _ = aime25_formatter(problem_data)
-        elif dataset_name == "aime24":
+        if dataset_name and dataset_name.startswith("aime"):
             from math_datasets.aime25 import aime25_formatter
             problem_text, _ = aime25_formatter(problem_data)
         elif dataset_name and "livemathbench" in dataset_name:
@@ -1056,6 +1531,10 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             from science_datasets.gpqa import gpqa_formatter
             _, ground_truth = gpqa_formatter(problem_data)
             return ground_truth
+        if dataset_name == "hle":
+            from hle_datasets.hle import get_hle_answer
+
+            return get_hle_answer(problem_data)
         return problem_data.get("answer") or problem_data.get("solution", "")
 
     def run_eval_only(
@@ -1063,9 +1542,11 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         dataset_list: List[str],
         max_problems: Optional[int],
         encyclopedia_paths: Optional[List[str]] = None,
+        encyclopedia_map: Optional[Dict[str, List[str]]] = None,
         problem_overrides: Optional[Dict[str, List[Dict]]] = None,
         output_subdir: str = "eval_only",
         summary_name: str = "eval_only_summary.json",
+        summary_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         """Eval-only mode: solve problems and check accuracy.
 
@@ -1082,10 +1563,12 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         """
         self._ensure_client()
 
-        # Build insights_section from encyclopedia
-        insights_section = ""
-        if encyclopedia_paths:
-            valid_eps = [ep for ep in encyclopedia_paths if ep and os.path.exists(ep)]
+        def build_insights_section(paths: Optional[List[str]]) -> str:
+            insights_section = ""
+            if not paths:
+                self._clear_client_encyclopedia()
+                return insights_section
+            valid_eps = [ep for ep in paths if ep and os.path.exists(ep)]
             if valid_eps:
                 print(f"Loading {len(valid_eps)} encyclopedias for guidance...")
                 self.client.load_encyclopedias(valid_eps, mode=self.mode)
@@ -1107,14 +1590,28 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
 INSTRUCTIONS: Review the insights above and actively apply the relevant techniques from insights to solve this problem. Consider which insights can help you approach the problem more effectively.
 
 """
+            else:
+                self._clear_client_encyclopedia()
+            return insights_section
+
+        # Build shared insights_section once unless an individual per-dataset map is provided.
+        shared_insights_section = ""
+        if encyclopedia_map:
+            print("Using individual per-dataset encyclopedias for guidance")
+        elif encyclopedia_paths:
+            shared_insights_section = build_insights_section(encyclopedia_paths)
         else:
+            self._clear_client_encyclopedia()
             print("No valid encyclopedias found; proceeding without guidance")
 
         print(f"\n{'='*80}")
         print("EVAL-ONLY MODE: Solve + Accuracy Check (no trace extraction / aggregation)")
         print(f"Datasets: {', '.join(dataset_list)}")
         print(f"Max problems per dataset: {max_problems or 'all'}")
-        print(f"Encyclopedia: {'yes' if insights_section else 'none'}")
+        print(
+            "Encyclopedia: "
+            f"{'individual' if encyclopedia_map else ('yes' if shared_insights_section else 'none')}"
+        )
         print(f"{'='*80}\n")
 
         accuracy_map = {}
@@ -1122,6 +1619,14 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         loop_map = {}
 
         for dataset_name in dataset_list:
+            if encyclopedia_map:
+                dataset_paths = encyclopedia_map.get(dataset_name, [])
+                insights_section = build_insights_section(dataset_paths)
+                if not insights_section:
+                    print(f"No valid encyclopedia found for {dataset_name}; evaluating without guidance")
+            else:
+                insights_section = shared_insights_section
+
             if problem_overrides and dataset_name in problem_overrides:
                 worklist = problem_overrides[dataset_name]
             else:
@@ -1132,54 +1637,113 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             eval_dir = os.path.join(self.output_dir, dataset_name, output_subdir)
             os.makedirs(eval_dir, exist_ok=True)
 
-            results = []
-            number_output_tokens_list = []
-            loop_count_list = []
+            indexed_problems = list(enumerate(worklist, 1))
+            parallel_clients = self.use_api and self.num_workers > 1
+            # OpenRouter performs admission control against the requested
+            # completion ceiling, not the tokens ultimately consumed. A 32K
+            # ceiling made short-answer GPQA/AIME requests fail with HTTP 402
+            # even in a one-worker run. Their full reasoning plus final answer
+            # fits comfortably in 4K; retain 16K only for code generation.
+            eval_max_output_tokens = (
+                4096 if dataset_name in {"aime26", "gpqa_diamond"} else 16384
+            )
+            execution_backend = (
+                f"spawn multiprocessing ({min(self.num_workers, len(indexed_problems))} "
+                "processes)"
+                if parallel_clients and indexed_problems
+                else "single process"
+            )
+            print(
+                f"  Execution backend: {execution_backend}; "
+                f"evaluation max_tokens={eval_max_output_tokens}"
+            )
 
-            for idx, problem_data in enumerate(worklist, 1):
-                problem_text, test_cases_for_eval = self._format_problem(problem_data, dataset_name)
-
-                if not problem_text:
-                    print(f"  [skip] Problem {idx} missing text")
-                    continue
-
-                print(f"  [{idx}/{len(worklist)}] {problem_text[:80]}...")
-
-                predicted_answer = None
-                is_correct = False
+            def completed_outcome(item):
+                """Return a valid per-problem checkpoint, or None."""
+                idx, problem_data = item
+                output_path = os.path.join(eval_dir, f"problem_{idx:04d}.json")
+                if not os.path.isfile(output_path):
+                    return None
                 try:
-                    # Only solve — no reflection or trace extraction
-                    prompt = self.client._get_solution_prompt(
+                    with open(output_path, "r", encoding="utf-8") as handle:
+                        output_data = json.load(handle)
+                except (OSError, ValueError, TypeError):
+                    return None
+                expected_id = problem_data.get("id", idx)
+                if not isinstance(output_data, dict):
+                    return None
+                if str(output_data.get("problem_id")) != str(expected_id):
+                    return None
+                required = {
+                    "solution",
+                    "is_correct",
+                    "number_output_tokens",
+                    "loop_count",
+                }
+                if not required.issubset(output_data):
+                    return None
+                return {
+                    "index": idx,
+                    "output_data": output_data,
+                    "is_correct": bool(output_data["is_correct"]),
+                    "number_output_tokens": int(
+                        output_data.get("number_output_tokens", 0) or 0
+                    ),
+                    "loop_count": int(output_data.get("loop_count", 0) or 0),
+                    "cached": True,
+                }
+
+            def evaluate_one(item):
+                idx, problem_data = item
+                problem_text, test_cases_for_eval = self._format_problem(problem_data, dataset_name)
+                if not problem_text:
+                    return {"index": idx, "skip": True}
+                image = None
+                image_source = "none"
+                if dataset_name == "hle":
+                    from hle_datasets.hle import extract_hle_image
+
+                    image, image_source = extract_hle_image(problem_data)
+                task_client = self.client
+                try:
+                    if image is not None and not isinstance(task_client, ChainOfThoughtReader):
+                        raise ValueError(
+                            "Multimodal HLE evaluation currently requires --client default."
+                        )
+                    prompt = task_client._get_solution_prompt(
                         problem_text, insights_section=insights_section
                     )
-                    response, token_info = self.client._call_model(prompt, None, max_new_tokens=32768)
-
+                    if image is not None:
+                        prompt = (
+                            "An image is attached to this problem. Use both the image "
+                            "and the question text; do not ignore visual evidence.\n\n"
+                            + prompt
+                        )
+                    response, token_info = task_client._call_model(
+                        prompt,
+                        None,
+                        max_new_tokens=eval_max_output_tokens,
+                        **({"image": image} if image is not None else {}),
+                    )
                     solution = response
                     number_output_tokens = token_info.get("output_tokens", 0)
-                    number_output_tokens_list.append(number_output_tokens)
-
+                    number_reasoning_tokens = token_info.get("reasoning_tokens", 0)
                     loop_count = self._count_consecutive_sentence_loops(solution)
-                    loop_count_list.append(loop_count)
-
                     predicted_answer = self._extract_answer_from_solution(
                         solution, dataset_name, problem_data
                     )
-
                     if test_cases_for_eval:
                         is_correct = self._check_answer_match(
                             solution, test_cases_for_eval, dataset_name, problem_text
                         )
-                        status = "+" if is_correct else "x"
-                        print(f"    {status} Code execution test results")
+                        ground_truth = None
                     else:
                         ground_truth = self._get_ground_truth(problem_data, dataset_name)
+                        is_correct = False
                         if predicted_answer:
                             is_correct = self._check_answer_match(
                                 predicted_answer, ground_truth, dataset_name, problem_text
                             )
-                        status = "+" if is_correct else "x"
-                        print(f"    {status} Predicted: {predicted_answer if predicted_answer else 'N/A'} | GT: {ground_truth if ground_truth else 'N/A'}")
-
                     output_data = {
                         "problem": problem_text,
                         "problem_id": problem_data.get("id", idx),
@@ -1187,22 +1751,145 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                         "predicted_answer": predicted_answer,
                         "is_correct": is_correct,
                         "number_output_tokens": number_output_tokens,
+                        "number_reasoning_tokens": number_reasoning_tokens,
                         "loop_count": loop_count,
+                        "multimodal_image_source": image_source,
+                        "worker_pid": os.getpid(),
                     }
-
-                    output_path = os.path.join(eval_dir, f"problem_{idx:04d}.json")
-                    with open(output_path, "w", encoding="utf-8") as f:
-                        json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-                    results.append({
+                    output_path = os.path.join(
+                        eval_dir, f"problem_{idx:04d}.json"
+                    )
+                    temporary_path = f"{output_path}.tmp.{os.getpid()}"
+                    with open(temporary_path, "w", encoding="utf-8") as handle:
+                        json.dump(output_data, handle, indent=2, ensure_ascii=False)
+                    os.replace(temporary_path, output_path)
+                    return {
+                        "index": idx,
+                        "output_data": output_data,
+                        "ground_truth": ground_truth,
+                        "test_cases": bool(test_cases_for_eval),
                         "is_correct": is_correct,
                         "number_output_tokens": number_output_tokens,
                         "loop_count": loop_count,
-                    })
-                    time.sleep(0.5)
-
+                        "worker_pid": os.getpid(),
+                    }
+                except OpenRouterInFlightBudgetError:
+                    # This is a shared account admission failure, not a bad
+                    # answer for one problem. Let the parallel executor cancel
+                    # queued work instead of issuing the same doomed request
+                    # for every remaining benchmark item.
+                    raise
                 except Exception as exc:
-                    print(f"    Error processing problem {idx}: {exc}")
+                    if is_openrouter_budget_error(exc):
+                        raise OpenRouterInFlightBudgetError(
+                            "OpenRouter rejected the benchmark request because "
+                            "the account budget cannot admit it. Stopping this "
+                            "run immediately; completed checkpoints remain "
+                            "resumable."
+                        ) from exc
+                    return {
+                        "index": idx,
+                        "error": str(exc),
+                        "worker_pid": os.getpid(),
+                    }
+                finally:
+                    if image is not None:
+                        try:
+                            image.close()
+                        except Exception:
+                            pass
+
+            workers = self.num_workers if parallel_clients else 1
+            cached_outcomes = {}
+            pending_problems = []
+            for item in indexed_problems:
+                checkpoint = completed_outcome(item)
+                if checkpoint is None:
+                    pending_problems.append(item)
+                else:
+                    cached_outcomes[item[0]] = checkpoint
+            if cached_outcomes:
+                print(
+                    f"  Resuming {len(cached_outcomes)} completed problem(s); "
+                    f"calling the API for {len(pending_problems)} remaining problem(s)"
+                )
+            if parallel_clients and pending_problems:
+                print(
+                    f"  Launching {min(workers, len(pending_problems))} independent "
+                    "API agent process(es)"
+                )
+                fresh_outcomes = parallel_utils.process_map_ordered(
+                    _evaluate_benchmark_problem_process,
+                    pending_problems,
+                    num_workers=workers,
+                    initializer=_initialize_benchmark_process,
+                    initargs=(
+                        self._process_config(
+                            dataset_name,
+                            insights_section,
+                            eval_dir=eval_dir,
+                            eval_max_output_tokens=eval_max_output_tokens,
+                        ),
+                    ),
+                )
+            else:
+                fresh_outcomes = parallel_utils.parallel_map_ordered(
+                    evaluate_one, pending_problems, num_workers=1
+                )
+            fresh_by_index = {
+                outcome["index"]: outcome for outcome in fresh_outcomes
+            }
+            outcomes = [
+                cached_outcomes.get(idx) or fresh_by_index[idx]
+                for idx, _ in indexed_problems
+            ]
+            results = []
+            evaluation_errors = []
+            for outcome in outcomes:
+                idx = outcome["index"]
+                if outcome.get("skip"):
+                    print(f"  [skip] Problem {idx} missing text")
+                    continue
+                if outcome.get("error"):
+                    print(f"    Error processing problem {idx}: {outcome['error']}")
+                    evaluation_errors.append((idx, outcome["error"]))
+                    continue
+                output_data = outcome["output_data"]
+                if outcome.get("cached"):
+                    print(
+                        f"  [{idx}/{len(worklist)}] [resume] "
+                        f"{output_data.get('problem', '')[:80]}..."
+                    )
+                else:
+                    print(
+                        f"  [{idx}/{len(worklist)}] "
+                        f"[pid={outcome.get('worker_pid', os.getpid())}] "
+                        f"{output_data['problem'][:80]}..."
+                    )
+                    status = "+" if outcome["is_correct"] else "x"
+                    if outcome["test_cases"]:
+                        print(f"    {status} Code execution test results")
+                    else:
+                        print(
+                            f"    {status} Predicted: {output_data['predicted_answer'] or 'N/A'} "
+                            f"| GT: {outcome['ground_truth'] or 'N/A'}"
+                        )
+                results.append({
+                    "is_correct": outcome["is_correct"],
+                    "number_output_tokens": outcome["number_output_tokens"],
+                    "loop_count": outcome["loop_count"],
+                })
+
+            if evaluation_errors:
+                failed_indices = ", ".join(
+                    str(idx) for idx, _ in evaluation_errors[:20]
+                )
+                raise RuntimeError(
+                    f"{len(evaluation_errors)} problem(s) failed in {dataset_name} "
+                    f"(indices: {failed_indices}). Successful problem files were "
+                    "saved. Rerun the same command to evaluate only missing/failed "
+                    "problems; no completion summary was written."
+                )
 
             # Summarize
             if results:
@@ -1229,7 +1916,13 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             "avg_tokens_per_dataset": token_map,
             "loop_count_per_dataset": loop_map,
             "encyclopedia_used": [ep for ep in (encyclopedia_paths or []) if ep and os.path.exists(ep)],
+            "individual_encyclopedia_used": {
+                ds: [ep for ep in paths if ep and os.path.exists(ep)]
+                for ds, paths in (encyclopedia_map or {}).items()
+            },
         }
+        if summary_metadata:
+            summary.update(summary_metadata)
 
         summary_path = os.path.join(self.output_dir, summary_name)
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -1244,6 +1937,209 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
 
         return summary
 
+    def run_cross_dataset_pipeline(
+        self,
+        train_datasets: List[str],
+        eval_datasets: List[str],
+        train_max_problems: Optional[int],
+        eval_max_problems: Optional[int] = None,
+        r1: float = 0.95,
+        r2: float = 0.4,
+        start_from_step: int = 1,
+    ) -> Dict:
+        """Run an unguided iteration 0, train insights, then evaluate held-out data."""
+        if not train_datasets:
+            raise ValueError("Provide at least one training dataset")
+        if not eval_datasets:
+            raise ValueError("Provide at least one held-out evaluation dataset")
+        if self.num_iterations < 1:
+            raise ValueError(
+                "Cross-dataset training requires --num-iterations of at least 1; "
+                "iteration 0 is added automatically as the unguided baseline."
+            )
+        overlap = sorted(set(train_datasets).intersection(eval_datasets))
+        if overlap:
+            raise ValueError(
+                "Training and held-out datasets must be disjoint; overlap: "
+                + ", ".join(overlap)
+            )
+
+        start_time = time.time()
+        baseline_datasets = list(dict.fromkeys(train_datasets + eval_datasets))
+        baseline_summary_path = Path(
+            self.output_dir, "iteration_0_baseline_summary.json"
+        )
+        baseline_summary = None
+        if baseline_summary_path.is_file():
+            try:
+                candidate = json.loads(
+                    baseline_summary_path.read_text(encoding="utf-8")
+                )
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("iteration") == 0
+                    and candidate.get("phase") == "unguided_baseline"
+                    and candidate.get("datasets") == baseline_datasets
+                ):
+                    baseline_summary = candidate
+            except (OSError, ValueError, TypeError):
+                baseline_summary = None
+
+        if baseline_summary is not None:
+            print(
+                "Iteration 0 summary already exists and matches this protocol; "
+                "skipping the unguided baseline"
+            )
+        else:
+            baseline_problems: Dict[str, List[Dict]] = {}
+            for dataset_name in baseline_datasets:
+                problems = self.load_math_dataset(dataset_name)
+                limit = (
+                    train_max_problems
+                    if dataset_name in train_datasets
+                    else eval_max_problems
+                )
+                baseline_problems[dataset_name] = (
+                    problems[:limit] if limit is not None else problems
+                )
+
+            print("\n" + "=" * 80)
+            print("ITERATION 0: UNGUIDED BASELINE (NO TRAINING / NO INSIGHT LIBRARY)")
+            print("=" * 80)
+            baseline_summary = self.run_eval_only(
+                dataset_list=baseline_datasets,
+                max_problems=None,
+                encyclopedia_paths=None,
+                problem_overrides=baseline_problems,
+                output_subdir="iteration_0_baseline",
+                summary_name="iteration_0_baseline_summary.json",
+                summary_metadata={
+                    "iteration": 0,
+                    "phase": "unguided_baseline",
+                    "training_performed": False,
+                    "insight_library_used": False,
+                },
+            )
+
+        print("\n" + "=" * 80)
+        print("ITERATION 1+: INSIGHT TRAINING")
+        print("=" * 80)
+        print(f"Training insight library on: {', '.join(train_datasets)}")
+        print(f"Held-out evaluation datasets: {', '.join(eval_datasets)}")
+        train_summary = self.run_iterative_pipeline(
+            dataset_list=train_datasets,
+            max_problems=train_max_problems,
+            r1=r1,
+            r2=r2,
+            start_from_step=start_from_step,
+            individual=False,
+        )
+
+        encyclopedia_name = (
+            "encyclopedia_all.json" if self.mode == "text" else "encyclopedia_all.txt"
+        )
+        encyclopedia_path = str(
+            Path(self.output_dir, encyclopedia_name).resolve()
+        )
+        if not os.path.isfile(encyclopedia_path):
+            raise FileNotFoundError(
+                "Training completed without the expected combined encyclopedia: "
+                f"{encyclopedia_path}"
+            )
+
+        iteration_encyclopedias = []
+        for item in train_summary.get("iteration_history", []):
+            path = item.get("iteration_encyclopedia")
+            if path and os.path.isfile(path):
+                iteration_encyclopedias.append(os.path.abspath(path))
+        if len(iteration_encyclopedias) != self.num_iterations:
+            raise FileNotFoundError(
+                "Expected one saved insight library per training iteration, but found "
+                f"{len(iteration_encyclopedias)} of {self.num_iterations}."
+            )
+
+        heldout_eval_by_iteration = []
+        for iteration, iteration_encyclopedia in enumerate(
+            iteration_encyclopedias, 1
+        ):
+            iteration_summary_name = (
+                f"heldout_eval_iter_{iteration:02d}_summary.json"
+            )
+            iteration_summary_path = Path(
+                self.output_dir, iteration_summary_name
+            )
+            iteration_eval_summary = None
+            if iteration_summary_path.is_file():
+                try:
+                    candidate = json.loads(
+                        iteration_summary_path.read_text(encoding="utf-8")
+                    )
+                    if (
+                        isinstance(candidate, dict)
+                        and candidate.get("iteration") == iteration
+                        and candidate.get("phase")
+                        == "heldout_iteration_matched"
+                        and candidate.get("datasets") == eval_datasets
+                        and os.path.abspath(
+                            candidate.get("iteration_encyclopedia", "")
+                        )
+                        == os.path.abspath(iteration_encyclopedia)
+                    ):
+                        iteration_eval_summary = candidate
+                except (OSError, ValueError, TypeError):
+                    iteration_eval_summary = None
+
+            if iteration_eval_summary is not None:
+                print(
+                    f"Held-out iteration {iteration} summary already exists; "
+                    "skipping this completed evaluation"
+                )
+            else:
+                print("\n" + "=" * 80)
+                print(
+                    f"HELD-OUT EVALUATION ITERATION {iteration}/{self.num_iterations}: "
+                    "ONE ITERATION-MATCHED LIBRARY"
+                )
+                print("=" * 80)
+                iteration_eval_summary = self.run_eval_only(
+                    dataset_list=eval_datasets,
+                    max_problems=eval_max_problems,
+                    encyclopedia_paths=[iteration_encyclopedia],
+                    output_subdir=f"heldout_eval_iter_{iteration:02d}",
+                    summary_name=iteration_summary_name,
+                    summary_metadata={
+                        "iteration": iteration,
+                        "phase": "heldout_iteration_matched",
+                        "iteration_encyclopedia": iteration_encyclopedia,
+                    },
+                )
+            heldout_eval_by_iteration.append(iteration_eval_summary)
+
+        eval_summary = heldout_eval_by_iteration[-1]
+
+        summary = {
+            "mode": "cross_dataset_train_eval",
+            "train_datasets": train_datasets,
+            "eval_datasets": eval_datasets,
+            "train_max_problems": train_max_problems,
+            "eval_max_problems": eval_max_problems,
+            "iteration_0_baseline": baseline_summary,
+            "encyclopedia": encyclopedia_path,
+            "iteration_encyclopedias": iteration_encyclopedias,
+            "heldout_evaluation_count": len(heldout_eval_by_iteration),
+            "heldout_eval_by_iteration": heldout_eval_by_iteration,
+            "train_summary": train_summary,
+            "eval_summary": eval_summary,
+            "total_time_seconds": time.time() - start_time,
+        }
+        summary_path = os.path.join(
+            self.output_dir, "cross_dataset_train_eval_summary.json"
+        )
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"Cross-dataset summary saved: {summary_path}")
+        return summary
+
     def run_split_pipeline(
         self,
         dataset_list: List[str],
@@ -1252,6 +2148,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         seed: int,
         r1: float = 0.95,
         r2: float = 0.4,
+        individual: bool = False,
     ) -> Dict:
         """Train an insight library on a random split, then eval on held-out problems.
 
@@ -1268,10 +2165,11 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         eval_output_dir = os.path.join(base_output_dir, "split_eval")
 
         split_manifest = {
-            "mode": "split",
+            "mode": "split_individual" if individual else "split",
             "split": split,
             "seed": seed,
             "max_problems": max_problems,
+            "individual": individual,
             "train_output_dir": train_output_dir,
             "eval_output_dir": eval_output_dir,
             "datasets": {},
@@ -1311,7 +2209,9 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         orig_output_dir = self.output_dir
         iteration_history = []
         encyclopedia_paths: Optional[List[str]] = None
+        encyclopedia_map: Dict[str, List[str]] = {}
         combined_ency_path = None
+        per_dataset_ency_paths: Dict[str, str] = {}
         try:
             for iteration in range(1, self.num_iterations + 1):
                 iter_train_dir = os.path.join(train_output_dir, f"iter_{iteration:02d}")
@@ -1328,11 +2228,14 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 print("=" * 80)
                 train_results_map: Dict[str, List[Dict]] = {}
                 for dataset_name in dataset_list:
+                    dataset_encyclopedia_paths = (
+                        encyclopedia_map.get(dataset_name) if individual else encyclopedia_paths
+                    )
                     _, train_results = self._extract_insights_for_dataset(
                         dataset_name=dataset_name,
                         problems=train_problem_map[dataset_name],
                         max_problems=None,
-                        encyclopedia_paths=encyclopedia_paths,
+                        encyclopedia_paths=dataset_encyclopedia_paths,
                         iteration=iteration,
                     )
                     train_results_map[dataset_name] = train_results
@@ -1345,9 +2248,24 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 for ds, acc in train_accuracy_map.items():
                     print(f"  - {ds}: {acc:.2%}")
 
-                print(f"\nIteration {iteration}: Generating combined encyclopedia from training split...")
-                combined_ency_path = self.generate_combined_encyclopedia(dataset_list, r1=r1, r2=r2)
-                encyclopedia_paths = [combined_ency_path] if combined_ency_path else []
+                if individual:
+                    print(
+                        f"\nIteration {iteration}: Generating individual encyclopedias from training split..."
+                    )
+                    per_dataset_ency_paths = self.aggregate_insights(
+                        dataset_list, r1=r1, r2=r2, iteration=iteration
+                    )
+                    encyclopedia_map = {
+                        dataset: [path] for dataset, path in per_dataset_ency_paths.items()
+                    }
+                    combined_ency_path = None
+                    encyclopedia_paths = None
+                else:
+                    print(f"\nIteration {iteration}: Generating combined encyclopedia from training split...")
+                    combined_ency_path = self.generate_combined_encyclopedia(
+                        dataset_list, r1=r1, r2=r2, iteration=iteration
+                    )
+                    encyclopedia_paths = [combined_ency_path] if combined_ency_path else []
 
                 # --- EVAL: eval-only on held-out split ---
                 self.output_dir = iter_eval_dir
@@ -1359,6 +2277,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                     dataset_list=dataset_list,
                     max_problems=None,
                     encyclopedia_paths=encyclopedia_paths,
+                    encyclopedia_map=encyclopedia_map if individual else None,
                     problem_overrides=eval_problem_map,
                     output_subdir="problems",
                     summary_name="split_eval_summary.json",
@@ -1369,6 +2288,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                     "train_accuracy": train_accuracy_map,
                     "eval_summary": eval_summary,
                     "combined_encyclopedia": combined_ency_path,
+                    "per_dataset_encyclopedias": per_dataset_ency_paths,
                 })
 
                 print(f"\nIteration {iteration} EVAL accuracy:")
@@ -1378,13 +2298,15 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             self.output_dir = orig_output_dir
 
         summary = {
-            "mode": "split",
+            "mode": "split_individual" if individual else "split",
             "split": split,
             "seed": seed,
             "num_iterations": self.num_iterations,
+            "individual": individual,
             "datasets": dataset_list,
             "split_manifest": split_manifest,
             "combined_encyclopedia": combined_ency_path,
+            "per_dataset_encyclopedias": per_dataset_ency_paths,
             "iteration_history": iteration_history,
         }
         summary_path = os.path.join(base_output_dir, "split_summary.json")
@@ -1403,6 +2325,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         r1: float = 0.95,
         r2: float = 0.4,
         start_from_step: int = 1,
+        individual: bool = False,
     ) -> Dict:
         """Run iterative learning pipeline.
 
@@ -1428,39 +2351,52 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         start_time = time.time()
         iteration_history = []
 
-        # Check if combined encyclopedia already exists (from previous runs)
-        # Use encyclopedia_all.json/txt instead of per-dataset encyclopedias
         encyclopedia_paths: Optional[List[str]] = None
-        if self.mode == "text":
-            combined_ency_path = os.path.join(self.output_dir, "encyclopedia_all.json")
-        else:
-            combined_ency_path = os.path.join(self.output_dir, "encyclopedia_all.txt")
+        encyclopedia_map: Dict[str, List[str]] = {}
+        combined_ency_path: Optional[str] = None
+        per_dataset_ency_paths: Dict[str, str] = {}
 
-        if os.path.exists(combined_ency_path):
-            encyclopedia_paths = [combined_ency_path]
-            print(f"Found existing combined encyclopedia: {combined_ency_path}")
+        if individual:
+            encyclopedia_map = self._find_existing_individual_encyclopedias(dataset_list)
+            if encyclopedia_map:
+                print(f"Found {len(encyclopedia_map)} individual per-dataset encyclopedias:")
+                for dataset_name, paths in encyclopedia_map.items():
+                    print(f"  - {dataset_name}: {paths[0]}")
         else:
-            # Fallback: check for per-dataset encyclopedias
-            per_dataset_encyclopedias = []
-            for dataset_name in dataset_list:
-                if self.mode == "text":
-                    dataset_ency = os.path.join(self.output_dir, dataset_name, "encyclopedia.json")
-                else:
-                    dataset_ency = os.path.join(self.output_dir, dataset_name, "encyclopedia.txt")
-                if os.path.exists(dataset_ency):
-                    per_dataset_encyclopedias.append(dataset_ency)
+            # Check if combined encyclopedia already exists (from previous runs)
+            # Use encyclopedia_all.json/txt instead of per-dataset encyclopedias
+            if self.mode == "text":
+                combined_ency_path = os.path.join(self.output_dir, "encyclopedia_all.json")
+            else:
+                combined_ency_path = os.path.join(self.output_dir, "encyclopedia_all.txt")
 
-            if per_dataset_encyclopedias:
-                encyclopedia_paths = per_dataset_encyclopedias
-                print(f"Found {len(per_dataset_encyclopedias)} per-dataset encyclopedias:")
-                for ep in per_dataset_encyclopedias:
-                    print(f"  - {ep}")
+            if os.path.exists(combined_ency_path):
+                encyclopedia_paths = [combined_ency_path]
+                print(f"Found existing combined encyclopedia: {combined_ency_path}")
+            else:
+                # Fallback: check for per-dataset encyclopedias
+                per_dataset_encyclopedias = []
+                for dataset_name in dataset_list:
+                    dataset_ency = self._dataset_encyclopedia_path(dataset_name)
+                    if os.path.exists(dataset_ency):
+                        per_dataset_encyclopedias.append(dataset_ency)
+
+                if per_dataset_encyclopedias:
+                    encyclopedia_paths = per_dataset_encyclopedias
+                    print(f"Found {len(per_dataset_encyclopedias)} per-dataset encyclopedias:")
+                    for ep in per_dataset_encyclopedias:
+                        print(f"  - {ep}")
 
         print(f"\n{'='*80}")
         print(f"Starting Iterative Learning Pipeline: {self.num_iterations} iterations")
+        print(f"Individual per-dataset mode: {'yes' if individual else 'no'}")
         print(f"Datasets: {', '.join(dataset_list)}")
         print(f"Max problems per dataset: {max_problems or 'all'}")
-        if encyclopedia_paths:
+        if individual and encyclopedia_map:
+            print(
+                f"Using {len(encyclopedia_map)} individual encyclopedias for iteration 1"
+            )
+        elif encyclopedia_paths:
             print(
                 f"Using {len(encyclopedia_paths)} existing encyclopedias for iteration 1"
             )
@@ -1471,11 +2407,65 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
             print(f"ITERATION {iteration}/{self.num_iterations}")
             print(f"{'='*80}")
 
+            if not individual:
+                completed_snapshot = self._iteration_encyclopedia_path(iteration)
+                if os.path.isfile(completed_snapshot):
+                    completed_snapshot = os.path.abspath(completed_snapshot)
+                    encyclopedia_paths = [completed_snapshot]
+                    combined_ency_path = completed_snapshot
+                    resumed_accuracy = self._resumable_extraction_accuracy(
+                        iteration, dataset_list, max_problems
+                    ) or {name: 0.0 for name in dataset_list}
+                    iteration_history.append(
+                        {
+                            "iteration": iteration,
+                            "datasets": dataset_list,
+                            "accuracy_per_dataset": resumed_accuracy,
+                            "combined_encyclopedia": completed_snapshot,
+                            "iteration_encyclopedia": completed_snapshot,
+                            "per_dataset_encyclopedias": {},
+                            "resumed": True,
+                        }
+                    )
+                    print(
+                        f"Iteration {iteration} library already exists; "
+                        "skipping completed extraction and aggregation"
+                    )
+                    continue
+
             # STEP 1: Extract insights (and solve if encyclopedia exists)
             if start_from_step == 1:
-                insights_map, accuracy_map = self.learn_insights_from_datasets(
-                    dataset_list, max_problems, encyclopedia_paths, iteration
+                resumed_accuracy = (
+                    None
+                    if individual
+                    else self._resumable_extraction_accuracy(
+                        iteration, dataset_list, max_problems
+                    )
                 )
+                if resumed_accuracy is not None:
+                    accuracy_map = resumed_accuracy
+                    insights_map = {
+                        name: os.path.join(self.output_dir, name)
+                        for name in dataset_list
+                    }
+                    print(
+                        f"Iteration {iteration} extraction is complete; "
+                        "resuming directly at aggregation/profiling"
+                    )
+                elif individual:
+                    insights_map: Dict[str, str] = {}
+                    accuracy_map: Dict[str, float] = {}
+                    for dataset_name in dataset_list:
+                        dataset_paths = encyclopedia_map.get(dataset_name)
+                        dataset_insights, dataset_accuracy = self.learn_insights_from_datasets(
+                            [dataset_name], max_problems, dataset_paths, iteration
+                        )
+                        insights_map.update(dataset_insights)
+                        accuracy_map.update(dataset_accuracy)
+                else:
+                    insights_map, accuracy_map = self.learn_insights_from_datasets(
+                        dataset_list, max_problems, encyclopedia_paths, iteration
+                    )
             else:
                 # Starting from step 2: check if insights exist from previous run
                 print(
@@ -1492,16 +2482,31 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                     )
                 accuracy_map = {name: 0.0 for name in dataset_list}
 
-            # STEP 2: Generate combined encyclopedia from all datasets at once
-            # Collect all skills from all available datasets instead of processing each individually
-            print(f"\nIteration {iteration}: Generating combined encyclopedia from all datasets...")
-            combined_ency_path = self.generate_combined_encyclopedia(dataset_list, r1=r1, r2=r2)
-            # Use only the combined encyclopedia for next iteration's Step 1
-            encyclopedia_paths = [combined_ency_path] if combined_ency_path else []
+            if individual:
+                print(f"\nIteration {iteration}: Generating individual encyclopedias per dataset...")
+                per_dataset_ency_paths = self.aggregate_insights(
+                    dataset_list, r1=r1, r2=r2, iteration=iteration
+                )
+                encyclopedia_map = {
+                    dataset: [path] for dataset, path in per_dataset_ency_paths.items()
+                }
+                combined_ency_path = None
+                encyclopedia_paths = None
+            else:
+                # STEP 2: Generate combined encyclopedia from all datasets at once
+                # Collect all skills from all available datasets instead of processing each individually
+                print(f"\nIteration {iteration}: Generating combined encyclopedia from all datasets...")
+                combined_ency_path = self.generate_combined_encyclopedia(
+                    dataset_list, r1=r1, r2=r2, iteration=iteration
+                )
+                # Use only the combined encyclopedia for next iteration's Step 1
+                encyclopedia_paths = [combined_ency_path] if combined_ency_path else []
 
-            # Note: Skipping per-dataset aggregation - we now do "generate all" approach
-            # to collect all skills from all datasets at once instead of one-by-one
-            # Old fallback approach was: per_dataset_ency = self.aggregate_insights(dataset_list, r1=r1, r2=r2)
+            iteration_encyclopedia_path = None
+            if not individual:
+                candidate = self._iteration_encyclopedia_path(iteration)
+                if os.path.isfile(candidate):
+                    iteration_encyclopedia_path = os.path.abspath(candidate)
 
             # Save iteration results
             iteration_summary = {
@@ -1509,19 +2514,26 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
                 "datasets": dataset_list,
                 "accuracy_per_dataset": accuracy_map,
                 "combined_encyclopedia": combined_ency_path,
+                "iteration_encyclopedia": iteration_encyclopedia_path,
+                "per_dataset_encyclopedias": per_dataset_ency_paths,
             }
             iteration_history.append(iteration_summary)
 
             print(f"\nIteration {iteration} Summary:")
             for dataset, acc in accuracy_map.items():
                 print(f"  - {dataset}: {acc:.2%}")
-            if encyclopedia_paths:
+            if individual and encyclopedia_map:
+                print("  Individual encyclopedias:")
+                for dataset_name, paths in encyclopedia_map.items():
+                    print(f"    - {dataset_name}: {paths[0]}")
+            elif encyclopedia_paths:
                 print(f"  Combined encyclopedia: {encyclopedia_paths[0]}")
 
         # Final summary
         final_summary = {
-            "mode": "iterative",
+            "mode": "iterative_individual" if individual else "iterative",
             "num_iterations": self.num_iterations,
+            "individual": individual,
             "datasets": dataset_list,
             "iteration_history": iteration_history,
             "total_time_seconds": time.time() - start_time,
@@ -1576,6 +2588,11 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         """
         if not solution:
             return None
+
+        if dataset_name == "hle":
+            from hle_datasets.hle import extract_hle_final_answer
+
+            return extract_hle_final_answer(solution)
 
         def _extract_boxed_balanced(text: str) -> Optional[str]:
             marker = "\\boxed{"
@@ -1645,7 +2662,7 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         # Strategy 3: Dataset-specific extraction strategies
         if dataset_name:
             # AIME/Math competition formats: look for "the answer is" patterns
-            if dataset_name in ["aime25", "aime24"] or dataset_name.startswith("imo"):
+            if dataset_name.startswith("aime") or dataset_name.startswith("imo"):
                 # Look for common answer phrases near the end
                 answer_patterns = [
                     r"(?:the answer is|answer:|final answer:?)\s*\$?([^.$\n]+)\$?",
@@ -1754,6 +2771,11 @@ INSTRUCTIONS: Review the insights above and actively apply the relevant techniqu
         if not predicted or not ground_truth:
             return False
 
+        if dataset_name == "hle":
+            from hle_datasets.hle import is_hle_answer_correct
+
+            return is_hle_answer_correct(predicted, ground_truth)
+
         # LiveMathBench datasets
         if dataset_name and "livemathbench" in dataset_name:
             return livemathbench_evaluator(
@@ -1838,17 +2860,36 @@ def main():
     parser = argparse.ArgumentParser(
         description="Iterative benchmark learning pipeline: solve (if encyclopedia available) + extract insights + aggregate → repeat"
     )
+    parallel_utils.add_num_workers_argument(parser)
     parser.add_argument(
         "--datasets",
         nargs="+",
         default=["aime25"],
-        help="Datasets for iterative learning (space- or comma-separated).",
+        help=(
+            "Datasets for iterative insight learning (space- or comma-separated). "
+            "With --eval-datasets, these are training datasets only."
+        ),
+    )
+    parser.add_argument(
+        "--eval-datasets",
+        nargs="+",
+        default=None,
+        help=(
+            "Disjoint held-out datasets to evaluate after building the combined "
+            "encyclopedia from --datasets."
+        ),
     )
     parser.add_argument(
         "--max-problems",
         type=int,
         default=None,
         help="Limit problems per dataset per iteration.",
+    )
+    parser.add_argument(
+        "--eval-max-problems",
+        type=int,
+        default=None,
+        help="Optional held-out evaluation limit per --eval-datasets dataset.",
     )
     parser.add_argument(
         "-m",
@@ -1893,6 +2934,23 @@ def main():
     )
     parser.add_argument(
         "--api-key", type=str, default=None, help="API key for the chosen provider.",
+    )
+    parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help=(
+            "Provider model name. For Gemini through OpenRouter, use a slug "
+            "such as google/gemini-2.5-flash-lite."
+        ),
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help=(
+            "Enable OpenRouter reasoning for every default-client generation "
+            "and text-mode insight aggregation call."
+        ),
     )
     parser.add_argument(
         "--load-in-8bit",
@@ -1947,11 +3005,23 @@ def main():
             "ace=ACEClient."
         ),
     )
+    parser.add_argument(
+        "--individual",
+        action="store_true",
+        help=(
+            "Use per-dataset insight isolation. Each dataset builds its own "
+            "encyclopedia from only that dataset's problems, and later solves "
+            "that dataset using only its own encyclopedia. In --split mode, "
+            "each dataset trains on its train split and evaluates on its eval "
+            "split without sharing insights with other datasets."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Normalize dataset lists
     datasets = _parse_list_arg(args.datasets)
+    eval_datasets = _parse_list_arg(args.eval_datasets)
 
     # Seeds
     random.seed(args.seed)
@@ -1971,17 +3041,43 @@ def main():
         use_api=args.use_api,
         api_key=args.api_key,
         api_provider=args.api_provider,
+        api_model=args.api_model,
+        reasoning_enabled=True if args.thinking else None,
         mode=args.mode,
         num_iterations=args.num_iterations,
         load_in_8bit=args.load_in_8bit,
         client_type=args.client,
+        num_workers=args.num_workers,
     )
 
     try:
         if not datasets:
             raise ValueError("--datasets is required")
+        if args.thinking and args.api_provider != "openrouter":
+            raise ValueError("--thinking currently requires --api-provider openrouter")
+        if args.thinking and args.client != "default":
+            raise ValueError("--thinking currently requires --client default")
 
-        if args.split is not None and args.eval_only:
+        if eval_datasets:
+            if args.split is not None:
+                raise ValueError("--eval-datasets cannot be combined with --split")
+            if args.eval_only:
+                raise ValueError("--eval-datasets cannot be combined with --eval-only")
+            if args.individual:
+                raise ValueError(
+                    "--eval-datasets requires a shared combined encyclopedia; "
+                    "it cannot be combined with --individual"
+                )
+            pipeline.run_cross_dataset_pipeline(
+                train_datasets=datasets,
+                eval_datasets=eval_datasets,
+                train_max_problems=args.max_problems,
+                eval_max_problems=args.eval_max_problems,
+                r1=args.r1,
+                r2=args.r2,
+                start_from_step=args.start_from_step,
+            )
+        elif args.split is not None and args.eval_only:
             # Eval-only on the held-out (eval) portion of a deterministic split.
             # Uses the same seed+split fraction as run_split_pipeline so the eval
             # subset is identical to what that pipeline would have evaluated.
@@ -2007,6 +3103,11 @@ def main():
                 dataset_list=datasets,
                 max_problems=None,
                 encyclopedia_paths=args.encyclopedia,
+                encyclopedia_map=(
+                    pipeline._find_existing_individual_encyclopedias(datasets)
+                    if args.individual and not args.encyclopedia
+                    else None
+                ),
                 problem_overrides=eval_problem_map,
             )
         elif args.split is not None:
@@ -2017,6 +3118,7 @@ def main():
                 seed=args.seed,
                 r1=args.r1,
                 r2=args.r2,
+                individual=args.individual,
             )
         elif args.eval_only:
             # Eval-only mode: solve + accuracy, no trace extraction or aggregation
@@ -2024,6 +3126,11 @@ def main():
                 dataset_list=datasets,
                 max_problems=args.max_problems,
                 encyclopedia_paths=args.encyclopedia,
+                encyclopedia_map=(
+                    pipeline._find_existing_individual_encyclopedias(datasets)
+                    if args.individual and not args.encyclopedia
+                    else None
+                ),
             )
         else:
             pipeline.run_iterative_pipeline(
@@ -2032,6 +3139,7 @@ def main():
                 r1=args.r1,
                 r2=args.r2,
                 start_from_step=args.start_from_step,
+                individual=args.individual,
             )
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}")
