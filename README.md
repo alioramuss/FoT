@@ -405,6 +405,9 @@ It is worth continuing to explore the design space of FoT, including personaliza
 
 [`experiment/`](experiment/) contains the research code behind the paper's results, and [`experiment/example_commands.sh`](experiment/example_commands.sh) lists the commands. It uses the same prompts as `src/fot`, but calls model APIs directly so that benchmark sweeps can run in parallel.
 
+## Running Logs
+We further release a subset of logs from our best-performing runs at [dixiyao/FoT_running_logs](https://huggingface.co/datasets/dixiyao/FoT_running_logs) for reference and future research, including studies of how malicious operations may affect reasoning traces, the insight library, and related behaviors. Access to the logs requires authentication and author approval. The logs are released under the CC BY-NC-ND 4.0 license and are restricted to non-commercial use. Please refer to the Hugging Face repository for detailed access requirements, usage instructions, and the code of conduct.
+
 | Application | Train (federation) | Evaluate | Runner |
 | --- | --- | --- | --- |
 | Multi-domain collaboration | Humanity's Last Exam | AIME26, GPQA Diamond, LiveCodeBench v6 | `task_benchmark_domain.py` |
